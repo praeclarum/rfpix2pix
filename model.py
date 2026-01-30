@@ -16,6 +16,7 @@ class RFPix2pixModel(nn.Module):
         num_inference_steps: int,
         timestep_sampling: str,
         velocity_net: Config,
+        saliency_net: Config,
     ):
         super().__init__()
         self.max_size = max_size
@@ -31,6 +32,16 @@ class RFPix2pixModel(nn.Module):
             input_channels=3,
             output_channels=3,
         )
+        self.saliency_net = object_from_config(saliency_net)
+        self.saliency_channels = self.saliency_net.output_channels
+        # Freeze saliency network - it's a pretrained feature extractor
+        self.freeze_saliency_net()
+
+    def freeze_saliency_net(self):
+        """Freeze saliency network parameters so they don't receive gradients."""
+        for param in self.saliency_net.parameters():
+            param.requires_grad = False
+        self.saliency_net.eval()
 
     def sample_timestep(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -92,7 +103,13 @@ class RFPix2pixModel(nn.Module):
 
     def compute_loss(self, x0: torch.Tensor, x1: torch.Tensor, t: Optional[torch.Tensor] = None) -> dict:
         """
-        Compute rectified flow matching loss.
+        Compute saliency-weighted rectified flow matching loss.
+        
+        From the paper: min_v ∫ E[||∇h(x_t)^T * (x1 - x0 - v(x_t, t))||²] dt
+        
+        The saliency network h(x) provides a feature mapping, and ∇h(x_t)^T acts
+        as a saliency score that re-weights coordinates so the loss focuses on
+        penalizing errors that cause significant changes in feature space.
         
         Args:
             x0: (B, 3, H, W) source domain image
@@ -101,24 +118,60 @@ class RFPix2pixModel(nn.Module):
             
         Returns:
             dict with:
-                - loss: scalar MSE loss between predicted and target velocity
+                - loss: scalar saliency-weighted MSE loss
                 - v_pred: predicted velocity
                 - v_target: target velocity
+                - jvp_result: (B, saliency_channels) JVP result for analysis
         """
+        from torch.autograd.functional import jvp
+        
         B = x0.shape[0]
         
         if t is None:
             t = self.sample_timestep(B, x0.device, x0.dtype)
         
         out = self.forward(x0, x1, t)
+        v_pred = out["v_pred"]
+        v_target = out["v_target"]
+        x_t = out["x_t"]
         
-        # MSE loss: ||v_pred - v_target||^2
-        loss = F.mse_loss(out["v_pred"], out["v_target"])
+        # Velocity error: v_target - v_pred
+        # NOTE: v_pred has gradients connected to velocity_net
+        v_error = v_target - v_pred  # (B, 3, H, W)
+        
+        # Compute saliency-weighted loss: ||J_h(x_t) @ v_error||²
+        # where J_h is the Jacobian of saliency_net
+        #
+        # The JVP computes: J_h @ v_error, giving shape (B, saliency_channels)
+        # 
+        # GRADIENT FLOW:
+        # - x_t is detached: saliency_net params won't receive gradients from x_t
+        # - v_error retains grad_fn: backprop flows through v_error -> v_pred -> velocity_net
+        # - create_graph=True: ensures the JVP op is in the computation graph
+        
+        def saliency_fn(x):
+            # saliency_net should be frozen (requires_grad=False on params)
+            return self.saliency_net(x)
+        
+        # Compute JVP: J_h(x_t) @ v_error
+        # x_t.detach() ensures no gradient flows through the "primal" input
+        # v_error is the "tangent" and retains its gradient connection
+        _, jvp_result = jvp(
+            saliency_fn,
+            (x_t.detach(),),  # primal: detached interpolated state
+            (v_error,),       # tangent: velocity error (has gradients!)
+            create_graph=True # keep in computation graph for backprop
+        )
+        # jvp_result: (B, saliency_channels) - velocity error in feature space
+        
+        # Loss: MSE of saliency-weighted velocity error
+        loss = (jvp_result ** 2).mean() # pyright: ignore[reportOperatorIssue]
         
         return {
             "loss": loss,
-            "v_pred": out["v_pred"],
-            "v_target": out["v_target"],
+            "v_pred": v_pred,
+            "v_target": v_target,
+            "jvp_result": jvp_result,
         }
 
     @torch.no_grad()
