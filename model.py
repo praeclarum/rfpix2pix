@@ -17,6 +17,7 @@ class RFPix2pixModel(nn.Module):
         timestep_sampling: str,
         velocity_net: Config,
         saliency_net: Config,
+        saliency_accuracy_threshold: int,
     ):
         super().__init__()
         self.max_size = max_size
@@ -27,6 +28,7 @@ class RFPix2pixModel(nn.Module):
         self.learning_rate = learning_rate
         self.num_inference_steps = num_inference_steps
         self.timestep_sampling = timestep_sampling
+        self.saliency_accuracy_threshold = saliency_accuracy_threshold
         self.velocity_net = object_from_config(
             velocity_net,
             input_channels=3,

@@ -10,7 +10,79 @@ from fnn import object_from_config, load_module, device
 from data import RFPix2pixDataset
 from model import RFPix2pixModel
 
-def train(model, dataset, run_id: str, step_start: int, dev: bool):
+SALIENCY_SENTINEL_FILE = "saliency_accuracy.txt"
+
+
+def read_saliency_accuracy(run_dir: str) -> Optional[int]:
+    """
+    Read the saliency accuracy from the sentinel file.
+    
+    Returns:
+        Integer percentage (0-100) or None if file doesn't exist.
+    """
+    sentinel_path = os.path.join(run_dir, SALIENCY_SENTINEL_FILE)
+    if not os.path.exists(sentinel_path):
+        return None
+    try:
+        with open(sentinel_path, "r") as f:
+            return int(f.read().strip())
+    except (ValueError, IOError):
+        return None
+
+
+def write_saliency_accuracy(run_dir: str, accuracy: float):
+    """
+    Write the saliency accuracy to the sentinel file.
+    
+    Args:
+        run_dir: Run directory path
+        accuracy: Accuracy as a float (0.0 to 1.0) or percentage (0-100)
+    """
+    # Convert to integer percentage if given as float
+    if accuracy <= 1.0:
+        accuracy_pct = int(round(accuracy * 100))
+    else:
+        accuracy_pct = int(round(accuracy))
+    
+    sentinel_path = os.path.join(run_dir, SALIENCY_SENTINEL_FILE)
+    with open(sentinel_path, "w") as f:
+        f.write(str(accuracy_pct))
+    print(f"Saved saliency accuracy: {accuracy_pct}%")
+
+
+def should_train_saliency(run_dir: str, threshold: int) -> bool:
+    """
+    Check if saliency training is needed.
+    
+    Args:
+        run_dir: Run directory path
+        threshold: Required accuracy percentage (0-100)
+        
+    Returns:
+        True if saliency training is needed, False otherwise.
+    """
+    accuracy = read_saliency_accuracy(run_dir)
+    if accuracy is None:
+        print(f"No saliency checkpoint found, training needed.")
+        return True
+    if accuracy < threshold:
+        print(f"Saliency accuracy {accuracy}% < {threshold}% threshold, training needed.")
+        return True
+    print(f"Saliency accuracy {accuracy}% >= {threshold}% threshold, skipping saliency training.")
+    return False
+
+
+def train_velocity(model, dataset, run_dir: str, step_start: int, dev: bool):
+    raise NotImplementedError("Training function is not yet implemented.")
+
+
+def train_saliency(model, dataset, run_dir: str, dev: bool) -> float:
+    """
+    Train the saliency network until it reaches acceptable accuracy.
+    
+    Returns:
+        Final accuracy as a float (0.0 to 1.0)
+    """
     raise NotImplementedError("Training function is not yet implemented.")
 
 
@@ -124,5 +196,10 @@ if __name__ == "__main__":
     with open(config_save_path, "w") as f:
         json.dump(config, f, indent=2)
     
-    # Dispatch to training
-    train(model, dataset, run_id, step_start=step_start, dev=args.dev)
+    # Phase 1: Train saliency network if needed
+    if should_train_saliency(run_dir, model.saliency_accuracy_threshold):
+        final_accuracy = train_saliency(model, dataset, run_dir, dev=args.dev)
+        write_saliency_accuracy(run_dir, final_accuracy)
+    
+    # Phase 2: Train velocity network
+    train_velocity(model, dataset, run_dir, step_start=step_start, dev=args.dev)
