@@ -10,44 +10,69 @@ from fnn import object_from_config, load_module, device
 from data import RFPix2pixDataset
 from model import RFPix2pixModel
 
-SALIENCY_SENTINEL_FILE = "saliency_accuracy.txt"
+SALIENCY_STATE_FILE = "saliency_state.json"
 
 
-def read_saliency_accuracy(run_dir: str) -> Optional[int]:
+def read_saliency_state(run_dir: str) -> dict:
     """
-    Read the saliency accuracy from the sentinel file.
+    Read the saliency training state from the state file.
     
     Returns:
-        Integer percentage (0-100) or None if file doesn't exist.
+        dict with keys:
+            - accuracy: int percentage (0-100) or None if not yet trained
+            - backbone_warmed_up: bool, True if backbone warmup phase is complete
     """
-    sentinel_path = os.path.join(run_dir, SALIENCY_SENTINEL_FILE)
-    if not os.path.exists(sentinel_path):
-        return None
+    state_path = os.path.join(run_dir, SALIENCY_STATE_FILE)
+    default_state = {
+        "accuracy": None,
+        "backbone_warmed_up": False,
+    }
+    if not os.path.exists(state_path):
+        return default_state
     try:
-        with open(sentinel_path, "r") as f:
-            return int(f.read().strip())
+        with open(state_path, "r") as f:
+            state = json.load(f)
+            # Ensure all expected keys exist
+            for key, default_value in default_state.items():
+                if key not in state:
+                    state[key] = default_value
+            return state
     except (ValueError, IOError):
-        return None
+        return default_state
 
 
-def write_saliency_accuracy(run_dir: str, accuracy: float):
+def write_saliency_state(run_dir: str, accuracy: Optional[float] = None, backbone_warmed_up: Optional[bool] = None):
     """
-    Write the saliency accuracy to the sentinel file.
+    Update the saliency training state file.
+    
+    Only updates the fields that are provided (not None).
     
     Args:
         run_dir: Run directory path
-        accuracy: Accuracy as a float (0.0 to 1.0) or percentage (0-100)
+        accuracy: Accuracy as a float (0.0 to 1.0) or percentage (0-100), or None to keep existing
+        backbone_warmed_up: Whether backbone warmup is complete, or None to keep existing
     """
-    # Convert to integer percentage if given as float
-    if accuracy <= 1.0:
-        accuracy_pct = int(round(accuracy * 100))
-    else:
-        accuracy_pct = int(round(accuracy))
+    # Read existing state
+    state = read_saliency_state(run_dir)
     
-    sentinel_path = os.path.join(run_dir, SALIENCY_SENTINEL_FILE)
-    with open(sentinel_path, "w") as f:
-        f.write(str(accuracy_pct))
-    print(f"Saved saliency accuracy: {accuracy_pct}%")
+    # Update provided fields
+    if accuracy is not None:
+        # Convert to integer percentage if given as float
+        if accuracy <= 1.0:
+            accuracy_pct = int(round(accuracy * 100))
+        else:
+            accuracy_pct = int(round(accuracy))
+        state["accuracy"] = accuracy_pct
+        print(f"Saved saliency accuracy: {accuracy_pct}%")
+    
+    if backbone_warmed_up is not None:
+        state["backbone_warmed_up"] = backbone_warmed_up
+        print(f"Saved backbone_warmed_up: {backbone_warmed_up}")
+    
+    # Write updated state
+    state_path = os.path.join(run_dir, SALIENCY_STATE_FILE)
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
 
 
 def should_train_saliency(run_dir: str, threshold: int) -> bool:
@@ -61,7 +86,8 @@ def should_train_saliency(run_dir: str, threshold: int) -> bool:
     Returns:
         True if saliency training is needed, False otherwise.
     """
-    accuracy = read_saliency_accuracy(run_dir)
+    state = read_saliency_state(run_dir)
+    accuracy = state["accuracy"]
     if accuracy is None:
         print(f"No saliency checkpoint found, training needed.")
         return True
@@ -72,8 +98,18 @@ def should_train_saliency(run_dir: str, threshold: int) -> bool:
     return False
 
 
-def train_velocity(model, dataset, run_dir: str, step_start: int, dev: bool):
-    raise NotImplementedError("Training function is not yet implemented.")
+def is_backbone_warmed_up(run_dir: str) -> bool:
+    """
+    Check if backbone warmup phase is complete.
+    
+    Args:
+        run_dir: Run directory path
+        
+    Returns:
+        True if backbone warmup is complete, False otherwise.
+    """
+    state = read_saliency_state(run_dir)
+    return state["backbone_warmed_up"]
 
 
 def train_saliency(model, dataset, run_dir: str, dev: bool) -> float:
@@ -83,6 +119,10 @@ def train_saliency(model, dataset, run_dir: str, dev: bool) -> float:
     Returns:
         Final accuracy as a float (0.0 to 1.0)
     """
+    raise NotImplementedError("Training function is not yet implemented.")
+
+
+def train_velocity(model, dataset, run_dir: str, step_start: int, dev: bool):
     raise NotImplementedError("Training function is not yet implemented.")
 
 
@@ -199,7 +239,7 @@ if __name__ == "__main__":
     # Phase 1: Train saliency network if needed
     if should_train_saliency(run_dir, model.saliency_accuracy_threshold):
         final_accuracy = train_saliency(model, dataset, run_dir, dev=args.dev)
-        write_saliency_accuracy(run_dir, final_accuracy)
+        write_saliency_state(run_dir, accuracy=final_accuracy)
     
     # Phase 2: Train velocity network
     train_velocity(model, dataset, run_dir, step_start=step_start, dev=args.dev)

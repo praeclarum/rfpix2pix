@@ -301,6 +301,10 @@ class SaliencyNet(nn.Module, ABC):
         - forward(x): Returns classification logits for domain classification
         - get_latent(x): Returns latent feature representation h(x)
         - output_channels: Number of channels in the latent representation
+    
+    Subclasses may optionally implement:
+        - freeze_backbone(): Freeze pretrained weights for head warmup
+        - unfreeze_backbone(): Unfreeze for full fine-tuning
     """
     
     @property
@@ -335,6 +339,24 @@ class SaliencyNet(nn.Module, ABC):
             
         Returns:
             (B, output_channels) latent features
+        """
+        pass
+    
+    def freeze_backbone(self):
+        """
+        Freeze pretrained backbone weights for head warmup training.
+        
+        Default implementation does nothing. Override in subclasses
+        that use pretrained backbones.
+        """
+        pass
+    
+    def unfreeze_backbone(self):
+        """
+        Unfreeze backbone for full fine-tuning.
+        
+        Default implementation does nothing. Override in subclasses
+        that use pretrained backbones.
         """
         pass
 
@@ -449,6 +471,29 @@ class ResNetSaliencyNet(SaliencyNet):
             base.layer3,
             base.layer4,
         )
+    
+    def freeze_backbone(self):
+        """
+        Freeze the pretrained backbone weights.
+        
+        Call this before initial training to let the new head layers
+        (latent_proj and classifier) learn meaningful representations
+        before fine-tuning the backbone.
+        """
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        self.backbone.eval()
+    
+    def unfreeze_backbone(self):
+        """
+        Unfreeze the backbone for full fine-tuning.
+        
+        Call this after the head layers have been warmed up to allow
+        end-to-end training of the entire network.
+        """
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+        self.backbone.train()
     
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
         """
