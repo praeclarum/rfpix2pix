@@ -32,6 +32,7 @@ class RFPix2pixModel(nn.Module):
             input_channels=3,
             output_channels=3,
         )
+        self.num_downsamples = self.velocity_net.num_downsamples
         self.saliency_net = object_from_config(saliency_net)
         self.saliency_channels = self.saliency_net.output_channels
         # Start with saliency network frozen (alternating training phases)

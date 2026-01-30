@@ -14,7 +14,7 @@ def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg
     paths.sort()
     return paths
 
-class AnimeitDataset(Dataset):
+class RFPix2pixDataset(Dataset):
     def __init__(self, domain_0_paths: list[str], domain_1_paths: list[str], max_size: int, num_downsamples: int):
         self.domain_0_image_paths = get_image_paths(domain_0_paths)
         self.domain_1_image_paths = get_image_paths(domain_1_paths)
