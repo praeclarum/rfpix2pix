@@ -54,19 +54,72 @@ class RFPix2pixModel(nn.Module):
         else:
             raise ValueError(f"Unknown timestep_sampling: {self.timestep_sampling}")
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> dict:
+    def forward(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> dict:
         """
         Training forward pass with flow matching.
         
+        Computes the interpolated state x_t and predicts the velocity field.
+        For rectified flow: x_t = t * x1 + (1 - t) * x0, target velocity = x1 - x0
+        
         Args:
-            x: (B, 3, H, W) input image
+            x0: (B, 3, H, W) source domain image
+            x1: (B, 3, H, W) target domain image
             t: (B,) timesteps in [0, 1]
             
         Returns:
-            v_pred: predicted velocity
+            dict with:
+                - v_pred: (B, 3, H, W) predicted velocity
+                - v_target: (B, 3, H, W) target velocity (x1 - x0)
+                - x_t: (B, 3, H, W) interpolated state
         """
-        v_pred = self.velocity_net(x, t)
-        return v_pred
+        # Reshape t for broadcasting: (B,) -> (B, 1, 1, 1)
+        t_broadcast = t[:, None, None, None]
+        
+        # Linear interpolation: x_t = t * x1 + (1 - t) * x0
+        x_t = t_broadcast * x1 + (1 - t_broadcast) * x0
+        
+        # Target velocity for rectified flow
+        v_target = x1 - x0
+        
+        # Predict velocity at interpolated state
+        v_pred = self.velocity_net(x_t, t)
+        
+        return {
+            "v_pred": v_pred,
+            "v_target": v_target,
+            "x_t": x_t,
+        }
+
+    def compute_loss(self, x0: torch.Tensor, x1: torch.Tensor, t: Optional[torch.Tensor] = None) -> dict:
+        """
+        Compute rectified flow matching loss.
+        
+        Args:
+            x0: (B, 3, H, W) source domain image
+            x1: (B, 3, H, W) target domain image  
+            t: (B,) timesteps in [0, 1], if None will be sampled
+            
+        Returns:
+            dict with:
+                - loss: scalar MSE loss between predicted and target velocity
+                - v_pred: predicted velocity
+                - v_target: target velocity
+        """
+        B = x0.shape[0]
+        
+        if t is None:
+            t = self.sample_timestep(B, x0.device, x0.dtype)
+        
+        out = self.forward(x0, x1, t)
+        
+        # MSE loss: ||v_pred - v_target||^2
+        loss = F.mse_loss(out["v_pred"], out["v_target"])
+        
+        return {
+            "loss": loss,
+            "v_pred": out["v_pred"],
+            "v_target": out["v_target"],
+        }
 
     @torch.no_grad()
     def generate(
