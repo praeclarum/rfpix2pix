@@ -1,8 +1,10 @@
+from abc import ABC, abstractmethod
 from typing import Optional
 
 import torch
 
 from fnn import *
+
 
 class RFPix2pixModel(nn.Module):
     def __init__(
@@ -35,7 +37,7 @@ class RFPix2pixModel(nn.Module):
             output_channels=3,
         )
         self.num_downsamples = self.velocity_net.num_downsamples
-        self.saliency_net = object_from_config(saliency_net)
+        self.saliency_net: SaliencyNet = object_from_config(saliency_net)
         self.saliency_channels = self.saliency_net.output_channels
         # Start with saliency network frozen (alternating training phases)
         self.eval_saliency()
@@ -285,3 +287,220 @@ class RFPix2pixModel(nn.Module):
         return z
 
 register_type("RFPix2pixModel", RFPix2pixModel)
+
+class SaliencyNet(nn.Module, ABC):
+    """
+    Abstract base class for saliency networks used in style transfer.
+    
+    Saliency networks provide a feature mapping h(x) for saliency-weighted loss.
+    The gradient ∇h(x) acts as a saliency score that re-weights coordinates
+    so the loss focuses on penalizing errors that cause significant changes
+    in feature space.
+    
+    Subclasses must implement:
+        - forward(x): Returns classification logits for domain classification
+        - get_latent(x): Returns latent feature representation h(x)
+        - output_channels: Number of channels in the latent representation
+    """
+    
+    @property
+    @abstractmethod
+    def output_channels(self) -> int:
+        """Number of channels in the latent feature representation."""
+        pass
+    
+    @abstractmethod
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for domain classification.
+        
+        Args:
+            x: (B, 3, H, W) input images in [-1, 1] range
+            
+        Returns:
+            (B, num_classes) classification logits
+        """
+        pass
+    
+    @abstractmethod
+    def get_latent(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Get latent feature representation h(x).
+        
+        This is the feature mapping used for saliency-weighted loss.
+        The gradient of this function provides the saliency weights.
+        
+        Args:
+            x: (B, 3, H, W) input images in [-1, 1] range
+            
+        Returns:
+            (B, output_channels) latent features
+        """
+        pass
+
+
+class ResNetSaliencyNet(SaliencyNet):
+    """
+    ResNet-based saliency network for domain classification.
+    
+    Uses a pretrained ResNet backbone from torchvision to extract features,
+    then classifies whether an image belongs to domain 0 or domain 1.
+    
+    Handles colorspace conversion from app's [-1, 1] range to ImageNet
+    normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]).
+    """
+    
+    # ResNet backbone output channels for each variant
+    BACKBONE_CHANNELS = {
+        "resnet18": 512,
+        "resnet34": 512,
+        "resnet50": 2048,
+        "resnet101": 2048,
+        "resnet152": 2048,
+    }
+    
+    # Type hints for registered buffers
+    imagenet_mean: torch.Tensor
+    imagenet_std: torch.Tensor
+    
+    def __init__(
+        self,
+        backbone: str = "resnet18",
+        num_classes: int = 2,
+        pretrained: bool = True,
+        latent_channels: int = 512,
+    ):
+        """
+        Initialize ResNet saliency network.
+        
+        Args:
+            backbone: ResNet variant to use ("resnet18", "resnet34", "resnet50", 
+                      "resnet101", "resnet152")
+            num_classes: Number of domain classes (typically 2)
+            pretrained: Whether to use ImageNet pretrained weights
+            latent_channels: Dimension of the latent feature space h(x)
+        """
+        super().__init__()
+        self.num_classes = num_classes
+        self.latent_channels = latent_channels
+        self._output_channels = latent_channels
+        
+        if backbone not in self.BACKBONE_CHANNELS:
+            raise ValueError(
+                f"Unknown backbone: {backbone}. "
+                f"Supported: {list(self.BACKBONE_CHANNELS.keys())}"
+            )
+        
+        # Register ImageNet normalization constants as buffers (move with model)
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+        
+        # Load pretrained backbone
+        self.backbone = self._create_backbone(backbone, pretrained)
+        backbone_out_channels = self.BACKBONE_CHANNELS[backbone]
+        
+        # Global average pooling
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Latent projection (this is h(x))
+        self.latent_proj = nn.Linear(backbone_out_channels, latent_channels)
+        
+        # Classification head
+        self.classifier = nn.Linear(latent_channels, num_classes)
+    
+    def _create_backbone(self, backbone: str, pretrained: bool) -> nn.Module:
+        """Create ResNet backbone without the final FC layer."""
+        if backbone == "resnet18":
+            from torchvision.models import resnet18, ResNet18_Weights
+            weights = ResNet18_Weights.DEFAULT if pretrained else None
+            base = resnet18(weights=weights)
+        elif backbone == "resnet34":
+            from torchvision.models import resnet34, ResNet34_Weights
+            weights = ResNet34_Weights.DEFAULT if pretrained else None
+            base = resnet34(weights=weights)
+        elif backbone == "resnet50":
+            from torchvision.models import resnet50, ResNet50_Weights
+            weights = ResNet50_Weights.DEFAULT if pretrained else None
+            base = resnet50(weights=weights)
+        elif backbone == "resnet101":
+            from torchvision.models import resnet101, ResNet101_Weights
+            weights = ResNet101_Weights.DEFAULT if pretrained else None
+            base = resnet101(weights=weights)
+        elif backbone == "resnet152":
+            from torchvision.models import resnet152, ResNet152_Weights
+            weights = ResNet152_Weights.DEFAULT if pretrained else None
+            base = resnet152(weights=weights)
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+        
+        return nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+            base.layer4,
+        )
+    
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Convert from app's [-1, 1] colorspace to ImageNet normalization.
+        
+        App colorspace: [-1, 1]
+        ImageNet expects: (x - mean) / std where x is in [0, 1]
+        
+        Conversion:
+            1. [-1, 1] -> [0, 1]: x_01 = (x + 1) / 2
+            2. [0, 1] -> ImageNet: (x_01 - mean) / std
+        """
+        # Convert [-1, 1] to [0, 1]
+        x_01 = (x + 1.0) / 2.0
+        # Apply ImageNet normalization
+        x_normalized = (x_01 - self.imagenet_mean) / self.imagenet_std
+        return x_normalized
+    
+    @property
+    def output_channels(self) -> int:
+        """Number of channels in the latent feature representation."""
+        return self._output_channels
+    
+    def get_latent(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Get latent feature representation h(x).
+        
+        Args:
+            x: (B, 3, H, W) input images in [-1, 1] range
+            
+        Returns:
+            (B, latent_channels) latent features
+        """
+        x_normalized = self._normalize_input(x)
+        features = self.backbone(x_normalized)  # (B, C, H', W')
+        pooled = self.pool(features)  # (B, C, 1, 1)
+        pooled = pooled.flatten(1)    # (B, C)
+        latent = self.latent_proj(pooled)  # (B, latent_channels)
+        return latent
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for domain classification.
+        
+        Args:
+            x: (B, 3, H, W) input images in [-1, 1] range
+            
+        Returns:
+            (B, num_classes) classification logits
+        """
+        latent = self.get_latent(x)
+        logits = self.classifier(latent)
+        return logits
+
+register_type("ResNetSaliencyNet", ResNetSaliencyNet)

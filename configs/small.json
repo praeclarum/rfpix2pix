@@ -17,5 +17,12 @@
         "activation": "SiLU",
         "num_res_blocks": 2,
         "zero_res_blocks": false
+    },
+    "saliency_net": {
+        "type": "ResNetSaliencyNet",
+        "backbone": "resnet18",
+        "num_classes": 2,
+        "pretrained": true,
+        "latent_channels": 512
     }
 }
