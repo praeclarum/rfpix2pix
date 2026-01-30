@@ -1,0 +1,20 @@
+{
+    "type": "RFPix2pixModel",
+    "max_size": 128,
+    "sample_batch_size": 4,
+    "train_batch_size": 8,
+    "train_minibatch_size": 4,
+    "train_images": 100000,
+    "learning_rate": 0.0002,
+    "num_inference_steps": 12,
+    "timestep_sampling": "logit-normal",
+    "velocity_net": {
+        "type": "UNet",
+        "model_channels": 64,
+        "ch_mult": [1, 2, 4, 4],
+        "normalization": "GroupNorm32",
+        "activation": "SiLU",
+        "num_res_blocks": 2,
+        "zero_res_blocks": false
+    }
+}

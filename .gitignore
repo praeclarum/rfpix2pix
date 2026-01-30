@@ -1,0 +1,11 @@
+.*
+!.vscode
+!.github
+!.gitignore
+!.gitattributes
+*.DS_Store
+__pycache__
+
+/runs
+/wandb
+/*.csv
