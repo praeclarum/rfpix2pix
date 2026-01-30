@@ -34,14 +34,83 @@ class RFPix2pixModel(nn.Module):
         )
         self.saliency_net = object_from_config(saliency_net)
         self.saliency_channels = self.saliency_net.output_channels
-        # Freeze saliency network - it's a pretrained feature extractor
-        self.freeze_saliency_net()
+        # Start with saliency network frozen (alternating training phases)
+        self.eval_saliency()
 
-    def freeze_saliency_net(self):
-        """Freeze saliency network parameters so they don't receive gradients."""
+    def eval_saliency(self):
+        """Freeze saliency network for velocity training phase."""
         for param in self.saliency_net.parameters():
             param.requires_grad = False
         self.saliency_net.eval()
+
+    def train_saliency(self):
+        """Unfreeze saliency network for saliency training phase."""
+        for param in self.saliency_net.parameters():
+            param.requires_grad = True
+        self.saliency_net.train()
+
+    def get_saliency(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Get domain classification logits from saliency network.
+        
+        Args:
+            x: (B, 3, H, W) input images
+            
+        Returns:
+            (B, num_classes) classification logits (typically 2 for domain 0/1)
+        """
+        return self.saliency_net(x)
+
+    def compute_saliency_loss(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+    ) -> dict:
+        """
+        Compute classification loss for training the saliency network.
+        
+        The saliency network learns to distinguish domain 0 from domain 1.
+        This provides meaningful gradients for the style-transfer loss.
+        
+        Args:
+            x0: (B, 3, H, W) images from domain 0
+            x1: (B, 3, H, W) images from domain 1
+            
+        Returns:
+            dict with:
+                - loss: scalar cross-entropy loss
+                - logits_0: (B, num_classes) logits for domain 0
+                - logits_1: (B, num_classes) logits for domain 1
+                - accuracy: classification accuracy
+        """
+        B = x0.shape[0]
+        
+        # Get classification logits for both domains
+        logits_0 = self.get_saliency(x0)  # (B, num_classes)
+        logits_1 = self.get_saliency(x1)  # (B, num_classes)
+        
+        # Concatenate logits and create labels
+        # Domain 0 -> label 0, Domain 1 -> label 1
+        logits = torch.cat([logits_0, logits_1], dim=0)  # (2B, num_classes)
+        labels = torch.cat([
+            torch.zeros(B, dtype=torch.long, device=x0.device),
+            torch.ones(B, dtype=torch.long, device=x1.device),
+        ], dim=0)  # (2B,)
+        
+        # Cross-entropy loss
+        loss = F.cross_entropy(logits, labels)
+        
+        # Compute accuracy for monitoring
+        with torch.no_grad():
+            preds = logits.argmax(dim=1)
+            accuracy = (preds == labels).float().mean()
+        
+        return {
+            "loss": loss,
+            "logits_0": logits_0,
+            "logits_1": logits_1,
+            "accuracy": accuracy,
+        }
 
     def sample_timestep(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         """
@@ -149,15 +218,16 @@ class RFPix2pixModel(nn.Module):
         # - v_error retains grad_fn: backprop flows through v_error -> v_pred -> velocity_net
         # - create_graph=True: ensures the JVP op is in the computation graph
         
-        def saliency_fn(x):
+        def saliency_latent_fn(x):
+            # Use get_latent to get the feature representation h(x)
             # saliency_net should be frozen (requires_grad=False on params)
-            return self.saliency_net(x)
+            return self.saliency_net.get_latent(x)
         
         # Compute JVP: J_h(x_t) @ v_error
         # x_t.detach() ensures no gradient flows through the "primal" input
         # v_error is the "tangent" and retains its gradient connection
         _, jvp_result = jvp(
-            saliency_fn,
+            saliency_latent_fn,
             (x_t.detach(),),  # primal: detached interpolated state
             (v_error,),       # tangent: velocity error (has gradients!)
             create_graph=True # keep in computation graph for backprop

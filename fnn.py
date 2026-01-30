@@ -523,3 +523,120 @@ class UNet3D(nn.Module):
         y = self.output_block(h)
         return y
 register_type("UNet3D", UNet3D)
+
+
+#
+# SALIENCY NETWORK
+#
+class SaliencyNet(nn.Module):
+    """
+    Domain classifier for saliency-weighted style transfer.
+    
+    Uses a pretrained backbone (e.g., ResNet) to extract features,
+    then classifies whether an image belongs to domain 0 or domain 1.
+    
+    The latent features (before classification head) serve as h(x),
+    and ∇h(x) provides saliency weights for the flow matching loss.
+    """
+    def __init__(
+        self,
+        backbone: str = "resnet18",
+        num_classes: int = 2,
+        pretrained: bool = True,
+        latent_channels: int = 512,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.latent_channels = latent_channels
+        self.output_channels = latent_channels  # for compatibility with RFPix2pixModel
+        
+        # Load pretrained backbone
+        if backbone == "resnet18":
+            from torchvision.models import resnet18, ResNet18_Weights
+            weights = ResNet18_Weights.DEFAULT if pretrained else None
+            base = resnet18(weights=weights)
+            self.backbone = nn.Sequential(
+                base.conv1,
+                base.bn1,
+                base.relu,
+                base.maxpool,
+                base.layer1,
+                base.layer2,
+                base.layer3,
+                base.layer4,
+            )
+            backbone_out_channels = 512
+        elif backbone == "resnet34":
+            from torchvision.models import resnet34, ResNet34_Weights
+            weights = ResNet34_Weights.DEFAULT if pretrained else None
+            base = resnet34(weights=weights)
+            self.backbone = nn.Sequential(
+                base.conv1,
+                base.bn1,
+                base.relu,
+                base.maxpool,
+                base.layer1,
+                base.layer2,
+                base.layer3,
+                base.layer4,
+            )
+            backbone_out_channels = 512
+        elif backbone == "resnet50":
+            from torchvision.models import resnet50, ResNet50_Weights
+            weights = ResNet50_Weights.DEFAULT if pretrained else None
+            base = resnet50(weights=weights)
+            self.backbone = nn.Sequential(
+                base.conv1,
+                base.bn1,
+                base.relu,
+                base.maxpool,
+                base.layer1,
+                base.layer2,
+                base.layer3,
+                base.layer4,
+            )
+            backbone_out_channels = 2048
+        else:
+            raise ValueError(f"Unknown backbone: {backbone}")
+        
+        # Global average pooling
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Latent projection (this is h(x))
+        self.latent_proj = nn.Linear(backbone_out_channels, latent_channels)
+        
+        # Classification head
+        self.classifier = nn.Linear(latent_channels, num_classes)
+    
+    def get_latent(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Get latent feature representation h(x).
+        
+        This is the feature mapping used for saliency-weighted loss.
+        
+        Args:
+            x: (B, 3, H, W) input images
+            
+        Returns:
+            (B, latent_channels) latent features
+        """
+        features = self.backbone(x)  # (B, C, H', W')
+        pooled = self.pool(features)  # (B, C, 1, 1)
+        pooled = pooled.flatten(1)    # (B, C)
+        latent = self.latent_proj(pooled)  # (B, latent_channels)
+        return latent
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for domain classification.
+        
+        Args:
+            x: (B, 3, H, W) input images
+            
+        Returns:
+            (B, num_classes) classification logits
+        """
+        latent = self.get_latent(x)
+        logits = self.classifier(latent)
+        return logits
+register_type("SaliencyNet", SaliencyNet)
