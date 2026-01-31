@@ -133,20 +133,31 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     num_steps = rf_model.train_images // rf_model.train_batch_size
     
     lr = rf_model.learning_rate
-    saliency_net.freeze_backbone()
-    frozen_backbone_optimizer: torch.optim.AdamW = torch.optim.AdamW(
-        saliency_net.parameters(),
-        lr=lr,
-        betas=(0.9, 0.999),
-        weight_decay=1e-4,
-    )
-    full_optimizer: Optional[torch.optim.AdamW] = None
+    
+    # Check if backbone warmup was already completed (resuming training)
+    backbone_already_warmed = is_backbone_warmed_up(run_dir)
+    
+    def create_optimizer(backbone_frozen: bool) -> torch.optim.AdamW:
+        """Create optimizer with appropriate parameter groups."""
+        param_groups = saliency_net.get_optimizer_param_groups(lr, backbone_frozen)
+        return torch.optim.AdamW(param_groups, betas=(0.9, 0.999), weight_decay=1e-4)
+    
+    if backbone_already_warmed:
+        # Resume with unfrozen backbone
+        saliency_net.unfreeze_backbone()
+        backbone_frozen = False
+    else:
+        # Start with frozen backbone for warmup
+        saliency_net.freeze_backbone()
+        backbone_frozen = True
+    
+    optimizer = create_optimizer(backbone_frozen)
 
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=rf_model.train_minibatch_size, shuffle=True, num_workers=4)
     data_iter = iter(dataloader)
 
-    run_dir = os.path.join("runs", run_id)
-    os.makedirs(run_dir, exist_ok=True)
+    # Extract run_id from run_dir for logging
+    run_id = os.path.basename(run_dir)
 
     if dev:
         wandb_run: Optional[wandb.wandb_run.Run] = None
@@ -165,23 +176,15 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     print(f"  minibatch size: {rf_model.train_minibatch_size}")
     print(f"  grad acc steps: {num_grad_acc_steps}")
     print(f"  learning rate: {lr}")
+    print(f"  backbone frozen: {backbone_frozen}")
 
-    sample_steps = 16
-    max_sample_steps = 128
-    next_sample_step = sample_steps
     save_steps = 256
     next_save_step = save_steps
 
     accuracy_item = 0.0
 
     progress = tqdm(range(num_steps))
-    for this_step in progress:
-        step = step_start + this_step
-        optimizer = full_optimizer
-        backbone_frozen = False
-        if optimizer is None:
-            backbone_frozen = True
-            optimizer = frozen_backbone_optimizer
+    for step in progress:
         optimizer.zero_grad()
         
         loss_item = 0.0
@@ -230,12 +233,9 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
         if backbone_frozen and int_accuracy >= rf_model.saliency_warmup_threshold:
             print(f"Saliency backbone warmup complete at step {step}, accuracy {int_accuracy}%")
             saliency_net.unfreeze_backbone()
-            full_optimizer = torch.optim.AdamW(
-                saliency_net.parameters(),
-                lr=lr,
-                betas=(0.9, 0.999),
-                weight_decay=1e-4,
-            )
+            # Create new optimizer with differential learning rates
+            optimizer = create_optimizer(backbone_frozen=False)
+            backbone_frozen = False
             write_saliency_state(run_dir, accuracy=int_accuracy, backbone_warmed_up=True)
         elif not backbone_frozen and int_accuracy >= rf_model.saliency_accuracy_threshold:
             print(f"Saliency training complete at step {step}, accuracy {int_accuracy}%")

@@ -361,6 +361,24 @@ class SaliencyNet(nn.Module, ABC):
         that use pretrained backbones.
         """
         pass
+    
+    def get_optimizer_param_groups(self, lr: float, backbone_frozen: bool) -> list:
+        """
+        Get parameter groups for optimizer with appropriate learning rates.
+        
+        Override this method to provide differential learning rates for
+        pretrained backbones vs new head layers.
+        
+        Args:
+            lr: Base learning rate
+            backbone_frozen: Whether backbone is currently frozen
+            
+        Returns:
+            List of parameter group dicts for optimizer, e.g.:
+            [{'params': [...], 'lr': lr}, {'params': [...], 'lr': lr * 0.1}]
+        """
+        # Default: single group with all parameters at base LR
+        return [{'params': self.parameters(), 'lr': lr}]
 
 
 class ResNetSaliencyNet(SaliencyNet):
@@ -496,6 +514,36 @@ class ResNetSaliencyNet(SaliencyNet):
         for param in self.backbone.parameters():
             param.requires_grad = True
         self.backbone.train()
+    
+    def get_optimizer_param_groups(self, lr: float, backbone_frozen: bool) -> list:
+        """
+        Get parameter groups with differential learning rates.
+        
+        When backbone is frozen, only head layers are included.
+        When backbone is unfrozen, backbone gets 10x lower LR to preserve
+        pretrained features.
+        
+        Args:
+            lr: Base learning rate for head layers
+            backbone_frozen: Whether backbone is currently frozen
+            
+        Returns:
+            List of parameter group dicts for optimizer
+        """
+        if backbone_frozen:
+            # Only head layers train during warmup
+            return [
+                {'params': self.latent_proj.parameters(), 'lr': lr},
+                {'params': self.classifier.parameters(), 'lr': lr},
+            ]
+        else:
+            # Differential LR: backbone gets 10x lower LR
+            backbone_lr = lr * 0.1
+            return [
+                {'params': self.backbone.parameters(), 'lr': backbone_lr},
+                {'params': self.latent_proj.parameters(), 'lr': lr},
+                {'params': self.classifier.parameters(), 'lr': lr},
+            ]
     
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
         """
