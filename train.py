@@ -1,4 +1,5 @@
 import gc
+import random
 from typing import Optional
 import argparse
 import os
@@ -6,10 +7,10 @@ import json
 import datetime
 
 import torch
-
 from tqdm import tqdm
 import wandb
 import wandb.wandb_run
+from PIL import Image
 
 from fnn import object_from_config, load_module, device, save_module
 from data import RFPix2pixDataset
@@ -95,10 +96,10 @@ def should_train_saliency(run_dir: str, threshold: float) -> bool:
     if accuracy is None:
         print(f"{C.YELLOW}⚠ No saliency checkpoint found, training needed.{C.RESET}")
         return True
-    if accuracy < threshold * 100:
+    if accuracy < threshold:
         print(f"{C.YELLOW}⚠ Saliency accuracy {accuracy*100:.2f}% < {threshold*100:.2f}% threshold, training needed.{C.RESET}")
         return True
-    print(f"{C.GREEN}✓ Saliency accuracy {accuracy}% >= {threshold}% threshold, skipping saliency training.{C.RESET}")
+    print(f"{C.GREEN}✓ Saliency accuracy {accuracy*100:.2f}% >= {threshold*100:.2f}% threshold, skipping saliency training.{C.RESET}")
     return False
 
 
@@ -129,6 +130,7 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     saliency_net = rf_model.saliency_net
 
     num_steps = rf_model.train_images // rf_model.train_batch_size
+    last_step = num_steps
     
     lr = rf_model.learning_rate
     
@@ -157,18 +159,7 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     # Extract run_id from run_dir for logging
     run_id = os.path.basename(run_dir)
 
-    if dev:
-        wandb_run: Optional[wandb.wandb_run.Run] = None
-    else:
-        wandb_run: Optional[wandb.wandb_run.Run] = wandb.init(
-            project="rfpix2pix_saliency",
-            save_code=True,
-            id=run_id,
-            config=rf_model.__config,  # pyright: ignore[reportArgumentType]
-        )
-        wandb_run.watch(saliency_net)
-
-    def save():
+    def save(step: int):
         save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
 
     num_grad_acc_steps = max(1, rf_model.train_batch_size // rf_model.train_minibatch_size)
@@ -186,7 +177,7 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     accuracy_item = 0.0
     accuracy_tracker = AccuracyTracker()
 
-    progress = tqdm(range(num_steps))
+    progress = tqdm(range(0, last_step), initial=0, total=last_step)
     for step in progress:
         optimizer.zero_grad()
         
@@ -224,17 +215,9 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             "acc": f"{accuracy_item*100:.2f}%",
             "acc_smooth": f"{smoothed_accuracy*100:.2f}%"
         })
-        if wandb_run is not None:
-            wlog = {
-                "saliency_loss": loss_item,
-                "saliency_accuracy": accuracy_item,
-                "saliency_accuracy_smoothed": accuracy_tracker.smoothed,
-                "lr": lr,
-            }
-            wandb_run.log(wlog)
         
         if step >= next_save_step:
-            save()
+            save(step)
             next_save_step = step + save_steps
 
         # Use smoothed accuracy for phase transition checks
@@ -246,16 +229,35 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             backbone_frozen = False
             # Reset tracker when entering new phase
             accuracy_tracker.reset()
-            save()
+            save(step)
             write_saliency_state(run_dir, accuracy=smoothed_accuracy, backbone_warmed_up=True)
         elif not backbone_frozen and accuracy_tracker.above_threshold(rf_model.saliency_accuracy_threshold):
             print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Saliency training complete{C.RESET} at step {C.CYAN}{step}{C.RESET}, smoothed accuracy {C.BRIGHT_GREEN}{smoothed_accuracy*100:.2f}%{C.RESET}\n")
-            save()
+            save(step)
             return accuracy_tracker.smoothed
         
     # Training ended without reaching threshold - return smoothed accuracy if available
-    save()
+    save(last_step)
     return accuracy_tracker.smoothed if accuracy_tracker.is_stable else accuracy_item
+
+@torch.no_grad()
+def sample(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, name: str):
+    # Generate sample grid
+    rows = []
+    for i in range(rf_model.sample_batch_size):
+        inputs = dataset[random.randint(0, len(dataset) - 1)]
+        input_image = inputs["domain_0"].unsqueeze(0).to(device)  # (1, 3, H, W)
+        output_image = rf_model.generate(input_image)
+        row = torch.cat([input_image, output_image], dim=3)  # (1, 3, H, 2W)
+        rows.append(row)
+    image = torch.cat(rows, dim=2)  # (1, 3, H*B, 2W)
+    image = (image.squeeze(0).cpu().numpy() + 1.0) * 127.5
+    image = image.clip(0, 255).astype("uint8")
+    image = Image.fromarray(image.transpose(1, 2, 0))
+    # Save the sample grid image
+    path = os.path.join(run_dir, f"{name}.jpg")
+    image.save(path, quality=90)
+    print(f"Saved sample grid to {path} ({image.width}x{image.height})")
 
 
 def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, step_start: int, dev: bool):
@@ -281,6 +283,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     velocity_net = rf_model.velocity_net
 
     num_steps = rf_model.train_images // rf_model.train_batch_size
+    last_step = step_start + num_steps
     
     lr = rf_model.learning_rate
     
@@ -306,9 +309,9 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
         wandb_run: Optional[wandb.wandb_run.Run] = None
     else:
         wandb_run: Optional[wandb.wandb_run.Run] = wandb.init(
-            project="rfpix2pix_velocity",
+            project="rfpix2pix",
             save_code=True,
-            id=f"{run_id}_velocity",
+            id=run_id,
             config=rf_model.__config,  # pyright: ignore[reportArgumentType]
         )
         wandb_run.watch(velocity_net)
@@ -326,14 +329,18 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}\n")
 
+    sample_steps = 32
+    max_sample_steps = 256
+    next_sample_step = step_start + sample_steps
+
     save_steps = 512
-    next_save_step = ((step_start // save_steps) + 1) * save_steps
+    next_save_step = step_start + save_steps
 
     # Loss tracking for smoothed display
     loss_window: list[float] = []
     loss_window_size = 100
 
-    progress = tqdm(range(step_start, num_steps), initial=step_start, total=num_steps)
+    progress = tqdm(range(step_start, last_step), initial=step_start, total=last_step - step_start)
     for step in progress:
         optimizer.zero_grad()
         
@@ -380,14 +387,19 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
                 "step": step,
             }
             wandb_run.log(wlog)
+
+        if step >= next_sample_step:
+            sample(rf_model, dataset, run_dir, f"step_{step:06d}")
+            sample_steps = min(sample_steps * 2, max_sample_steps)
+            next_sample_step = step + sample_steps
         
         if step >= next_save_step:
             save(step)
             next_save_step = step + save_steps
 
     # Final save
-    save(num_steps)
-    print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Velocity training complete{C.RESET} at step {C.CYAN}{num_steps}{C.RESET}\n")
+    save(last_step)
+    print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Velocity training complete{C.RESET} at step {C.CYAN}{last_step}{C.RESET}\n")
 
 
 def parse_args():
@@ -434,12 +446,6 @@ Examples:
         help="Path to checkpoint file to resume training"
     )
     parser.add_argument(
-        "--run-id",
-        type=str,
-        default=None,
-        help="Run ID for output directory (auto-generated if not provided)"
-    )
-    parser.add_argument(
         "--dev",
         action="store_true",
         help="Development mode (smaller batches, more frequent logging)"
@@ -460,12 +466,9 @@ if __name__ == "__main__":
     
     # Generate run ID
     date_id = datetime.datetime.now().strftime("%Y%m%d%H%M")
-    if args.run_id:
-        run_id = args.run_id
-    else:
-        run_id = f"run_{date_id}"
-        if args.dev:
-            run_id += "_dev"
+    run_id = f"run_{date_id}"
+    if args.dev:
+        run_id += "_dev"
     
     # Load or create model
     step_start = 0
@@ -475,9 +478,16 @@ if __name__ == "__main__":
         print(f"{C.BLUE}▶ Loading model from {C.BOLD}{args.checkpoint}{C.RESET}")
         model: RFPix2pixModel = load_module(args.checkpoint).to(device)  # type: ignore
         config = model.__config
+        run_dir = os.path.dirname(args.checkpoint)
+        run_id = os.path.basename(run_dir)
     else:
         print(f"{C.BLUE}▶ Creating new model{C.RESET}")
         model: RFPix2pixModel = object_from_config(config).to(device)
+        run_dir = os.path.join("runs", run_id)
+        os.makedirs(run_dir, exist_ok=True)
+        config_save_path = os.path.join(run_dir, "config.json")
+        with open(config_save_path, "w") as f:
+            json.dump(config, f, indent=2)
     
     model.compile()
     
@@ -491,14 +501,10 @@ if __name__ == "__main__":
     print(f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} domain 0 images, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
     
     # Create run directory
-    run_dir = os.path.join("runs", run_id)
-    os.makedirs(run_dir, exist_ok=True)
     print(f"{C.BLUE}▶ Run directory:{C.RESET} {C.BOLD}{run_dir}{C.RESET}\n")
-    
-    # Save config to run directory
-    config_save_path = os.path.join(run_dir, "config.json")
-    with open(config_save_path, "w") as f:
-        json.dump(config, f, indent=2)
+
+    # Sample to make sure everything is working
+    sample(model, dataset, run_dir, f"init_{step_start}")
     
     # Phase 1: Train saliency network if needed
     if should_train_saliency(run_dir, model.saliency_accuracy_threshold):

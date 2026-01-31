@@ -8,8 +8,8 @@
     "learning_rate": 0.0002,
     "num_inference_steps": 12,
     "timestep_sampling": "logit-normal",
-    "saliency_accuracy_threshold": 0.9999,
-    "saliency_warmup_threshold": 0.75,
+    "saliency_accuracy_threshold": 0.9998,
+    "saliency_warmup_threshold": 0.90,
     "velocity_net": {
         "type": "UNet",
         "model_channels": 64,
