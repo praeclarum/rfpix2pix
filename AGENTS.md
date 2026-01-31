@@ -27,3 +27,34 @@ It is able to work with unpaired images by using a feature mapping of an image. 
 - Uses PyTorch for all training
 - Uses pre-trained models from torchvision for feature extraction
 - Uses a UNet architecture for the velocity field
+- Images are normalized to [-1, 1] colorspace throughout the app
+
+## Training Procedure
+
+Training happens in two phases:
+
+### Phase 1: Saliency Network Training
+
+The saliency network `h(x)` is a domain classifier (e.g., ResNet-based) that learns to distinguish images from domain 0 vs domain 1. Its latent features and gradients are used to weight the velocity loss.
+
+This phase has two sub-phases for pretrained backbones:
+
+1. **Backbone Warmup** (frozen backbone): Train only the head layers (`latent_proj`, `classifier`) until accuracy reaches `saliency_warmup_threshold` (default 70%). This prevents random gradients from corrupting pretrained weights.
+
+2. **Full Fine-tuning** (unfrozen backbone): Continue training the entire network until accuracy reaches `saliency_accuracy_threshold` (default 90%).
+
+Training state is saved in `runs/<run_id>/saliency_state.json`:
+```json
+{
+  "accuracy": 95,
+  "backbone_warmed_up": true
+}
+```
+
+### Phase 2: Velocity Network Training
+
+Once the saliency network is trained, it is frozen and the velocity network is trained using the saliency-weighted flow matching loss:
+
+`loss = ||J_h(x_t) @ (v_target - v_pred)||²`
+
+where `J_h` is the Jacobian of the saliency network's `get_latent()` function, computed via JVP (Jacobian-vector product).
