@@ -87,6 +87,11 @@ Examples:
         help="Resize existing images in output directory to meet --max-size constraint and exit"
     )
     parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Verify existing domain0/domain1 images with the saliency network. Moves misclassified or low-confidence images to 'uncertain'"
+    )
+    parser.add_argument(
         "--quality", "-q",
         type=int,
         default=95,
@@ -283,6 +288,133 @@ def resize_existing(output_dir: Path, max_size: int, quality: int = 95):
     print(f"{C.GREEN}{'='*50}{C.RESET}")
 
 
+def verify_existing(
+    output_dir: Path,
+    model: RFPix2pixModel,
+    threshold: float,
+    batch_size: int = 16
+):
+    """
+    Re-classify existing images in domain0/domain1 using the saliency network.
+    Moves images to 'uncertain' if the network now classifies them differently
+    or with low confidence.
+    
+    Args:
+        output_dir: Path to output directory with domain0/domain1/uncertain subdirs
+        model: Loaded RFPix2pixModel with trained saliency network
+        threshold: Confidence threshold (images below this go to uncertain)
+        batch_size: Batch size for inference
+    """
+    image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
+    max_size = model.max_size
+    uncertain_dir = output_dir / "uncertain"
+    uncertain_dir.mkdir(parents=True, exist_ok=True)
+    
+    stats = {
+        "domain0_verified": 0,
+        "domain0_to_uncertain": 0,
+        "domain1_verified": 0,
+        "domain1_to_uncertain": 0,
+        "skipped_error": 0,
+    }
+    
+    # Collect images from domain0 and domain1 only
+    images_to_verify: List[Tuple[Path, int]] = []  # (path, expected_domain)
+    for domain_idx, domain_name in enumerate(["domain0", "domain1"]):
+        domain_path = output_dir / domain_name
+        if domain_path.exists():
+            for file_path in domain_path.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in image_extensions:
+                    images_to_verify.append((file_path, domain_idx))
+    
+    print(f"{C.BLUE}▶ Found {len(images_to_verify)} images to verify{C.RESET}")
+    
+    if not images_to_verify:
+        print(f"{C.YELLOW}⚠ No images found in domain0 or domain1{C.RESET}")
+        return
+    
+    # Process in batches
+    batch_paths: List[Path] = []
+    batch_domains: List[int] = []
+    batch_tensors: List[torch.Tensor] = []
+    
+    def process_batch():
+        if not batch_tensors:
+            return
+        
+        # Stack and move to device
+        images = torch.stack(batch_tensors).to(device)
+        
+        # Classify
+        predictions, confidences = classify_batch(model, images)
+        predictions = predictions.cpu().numpy()
+        confidences = confidences.cpu().numpy()
+        
+        # Check each image
+        for path, expected_domain, pred, conf in zip(batch_paths, batch_domains, predictions, confidences):
+            # Move to uncertain only if: wrong prediction AND high confidence
+            if pred != expected_domain and conf >= threshold:
+                dest_path = uncertain_dir / path.name
+                # Handle filename collision
+                if dest_path.exists():
+                    # Already exists in uncertain, just remove the source
+                    path.unlink()
+                else:
+                    shutil.move(str(path), str(dest_path))
+                
+                if expected_domain == 0:
+                    stats["domain0_to_uncertain"] += 1
+                else:
+                    stats["domain1_to_uncertain"] += 1
+            else:
+                # Verified as correct
+                if expected_domain == 0:
+                    stats["domain0_verified"] += 1
+                else:
+                    stats["domain1_verified"] += 1
+        
+        # Clear batch
+        batch_paths.clear()
+        batch_domains.clear()
+        batch_tensors.clear()
+    
+    for file_path, expected_domain in tqdm(images_to_verify, desc="Verifying", unit="img"):
+        try:
+            # Load image for inference
+            image_tensor = load_image_for_inference(str(file_path), max_size)
+            
+            batch_paths.append(file_path)
+            batch_domains.append(expected_domain)
+            batch_tensors.append(image_tensor)
+            
+            if len(batch_tensors) >= batch_size:
+                process_batch()
+                
+        except Exception as e:
+            stats["skipped_error"] += 1
+            tqdm.write(f"{C.RED}✗ Error processing {file_path}: {e}{C.RESET}")
+    
+    # Process remaining batch
+    process_batch()
+    
+    # Print summary
+    print()
+    print(f"{C.GREEN}{'='*50}{C.RESET}")
+    print(f"{C.GREEN}Verification Complete{C.RESET}")
+    print(f"{C.GREEN}{'='*50}{C.RESET}")
+    print(f"  Domain 0 verified:     {stats['domain0_verified']:>6}")
+    print(f"  Domain 0 → uncertain:  {stats['domain0_to_uncertain']:>6}")
+    print(f"  Domain 1 verified:     {stats['domain1_verified']:>6}")
+    print(f"  Domain 1 → uncertain:  {stats['domain1_to_uncertain']:>6}")
+    print(f"  Skipped (error):       {stats['skipped_error']:>6}")
+    print(f"{C.GREEN}{'='*50}{C.RESET}")
+    total_moved = stats['domain0_to_uncertain'] + stats['domain1_to_uncertain']
+    total_verified = stats['domain0_verified'] + stats['domain1_verified']
+    print(f"  Total verified: {total_verified}")
+    print(f"  Total moved:    {total_moved}")
+    print()
+
+
 def load_image_for_inference(path: str, max_size: int) -> torch.Tensor:
     """
     Load and preprocess an image for inference.
@@ -358,6 +490,12 @@ def main():
     model.eval_saliency()
     max_size = model.max_size
     print(f"{C.GREEN}✓ Model loaded (image size: {max_size}x{max_size}){C.RESET}")
+    
+    # Handle verify mode
+    if args.verify:
+        print(f"{C.BLUE}▶ Verifying existing images with threshold {args.threshold}{C.RESET}")
+        verify_existing(output_dir, model, args.threshold, args.batch_size)
+        return
     
     # Get existing hashes to skip
     existing_hashes = get_existing_hashes(output_dir)
