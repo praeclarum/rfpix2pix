@@ -324,7 +324,7 @@ def sample_structure_pairings(
     grid = Image.fromarray(grid.transpose(1, 2, 0))
     
     # Save the proof sheet
-    path = os.path.join(run_dir, "structure_pairings.jpg")
+    path = os.path.join(run_dir, "pairings.jpg")
     grid.save(path, quality=90)
     print(f"{C.GREEN}✓ Saved structure pairing proof sheet to {C.BOLD}{path}{C.RESET}")
     print(f"  {C.DIM}Grid: {len(domain_0_indices)} rows × {k + 1} columns (source + {k} matches){C.RESET}\n")

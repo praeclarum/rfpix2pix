@@ -129,14 +129,24 @@ class RFPix2pixDataset(Dataset):
         """Load an image and preprocess it to fit the model requirements."""
         image = Image.open(path).convert("RGB")
         src_width, src_height = image.size
-        prescale = 0.8 + 0.2 * random.random()
+        prescale = 0.9 + 0.1 * random.random()
         if src_width >= src_height:
-            crop_size = int(src_height * prescale)
+            haspect = min(4/3, src_width / src_height)
+            crop_height = int(src_height * prescale)
+            crop_width = int(crop_height * haspect)
+            if crop_width > src_width:
+                crop_width = src_width
+                crop_height = int(crop_width / haspect)
         else:
-            crop_size = int(src_width * prescale)
-        crop_x = random.randint(0, src_width - crop_size)
-        crop_y = random.randint(0, src_height - crop_size)
-        image = image.crop((crop_x, crop_y, crop_x + crop_size, crop_y + crop_size))
+            vaspect = min(4/3, src_height / src_width)
+            crop_width = int(src_width * prescale)
+            crop_height = int(crop_width * vaspect)
+            if crop_height > src_height:
+                crop_height = src_height
+                crop_width = int(crop_height / vaspect)
+        crop_x = (src_width - crop_width) // 2
+        crop_y = (src_height - crop_height) // 2
+        image = image.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
         image = image.resize((self.max_image_size, self.max_image_size), Image.LANCZOS)
         image_array = np.array(image).astype(np.float32) / 127.5 - 1.0
         image_array = np.transpose(image_array, (2, 0, 1))
