@@ -19,8 +19,8 @@ class RFPix2pixModel(nn.Module):
         timestep_sampling: str,
         velocity_net: Config,
         saliency_net: Config,
-        saliency_accuracy_threshold: int,
-        saliency_warmup_threshold: int = 70,
+        saliency_accuracy_threshold: float,
+        saliency_warmup_threshold: float,
     ):
         super().__init__()
         self.max_size = max_size

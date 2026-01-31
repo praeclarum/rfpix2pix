@@ -1,35 +1,12 @@
-from collections import defaultdict
 import gc
 from typing import Optional
 import argparse
 import os
-import sys
 import json
 import datetime
 
 import torch
 
-# Terminal colors
-class Colors:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    
-    # Regular colors
-    GREEN = "\033[32m"
-    YELLOW = "\033[33m"
-    BLUE = "\033[34m"
-    MAGENTA = "\033[35m"
-    CYAN = "\033[36m"
-    
-    # Bright colors
-    BRIGHT_GREEN = "\033[92m"
-    BRIGHT_YELLOW = "\033[93m"
-    BRIGHT_BLUE = "\033[94m"
-    BRIGHT_MAGENTA = "\033[95m"
-    BRIGHT_CYAN = "\033[96m"
-
-C = Colors  # Short alias
 from tqdm import tqdm
 import wandb
 import wandb.wandb_run
@@ -37,6 +14,9 @@ import wandb.wandb_run
 from fnn import object_from_config, load_module, device, save_module
 from data import RFPix2pixDataset
 from model import RFPix2pixModel
+
+from utils import Colors as C
+from utils import AccuracyTracker
 
 SALIENCY_STATE_FILE = "saliency_state.json"
 
@@ -77,7 +57,7 @@ def write_saliency_state(run_dir: str, accuracy: Optional[float] = None, backbon
     
     Args:
         run_dir: Run directory path
-        accuracy: Accuracy as a float (0.0 to 1.0) or percentage (0-100), or None to keep existing
+        accuracy: Accuracy as a float (0.0 to 1.0), or None to keep existing
         backbone_warmed_up: Whether backbone warmup is complete, or None to keep existing
     """
     # Read existing state
@@ -86,12 +66,8 @@ def write_saliency_state(run_dir: str, accuracy: Optional[float] = None, backbon
     # Update provided fields
     if accuracy is not None:
         # Convert to integer percentage if given as float
-        if accuracy <= 1.0:
-            accuracy_pct = int(round(accuracy * 100))
-        else:
-            accuracy_pct = int(round(accuracy))
-        state["accuracy"] = accuracy_pct
-        print(f"{C.DIM}Saved saliency accuracy: {C.CYAN}{accuracy_pct}%{C.RESET}")
+        state["accuracy"] = accuracy
+        print(f"{C.DIM}Saved saliency accuracy: {C.CYAN}{accuracy*100:.2f}%{C.RESET}")
     
     if backbone_warmed_up is not None:
         state["backbone_warmed_up"] = backbone_warmed_up
@@ -103,13 +79,13 @@ def write_saliency_state(run_dir: str, accuracy: Optional[float] = None, backbon
         json.dump(state, f, indent=2)
 
 
-def should_train_saliency(run_dir: str, threshold: int) -> bool:
+def should_train_saliency(run_dir: str, threshold: float) -> bool:
     """
     Check if saliency training is needed.
     
     Args:
         run_dir: Run directory path
-        threshold: Required accuracy percentage (0-100)
+        threshold: Required accuracy (0-1)
         
     Returns:
         True if saliency training is needed, False otherwise.
@@ -119,8 +95,8 @@ def should_train_saliency(run_dir: str, threshold: int) -> bool:
     if accuracy is None:
         print(f"{C.YELLOW}⚠ No saliency checkpoint found, training needed.{C.RESET}")
         return True
-    if accuracy < threshold:
-        print(f"{C.YELLOW}⚠ Saliency accuracy {accuracy}% < {threshold}% threshold, training needed.{C.RESET}")
+    if accuracy < threshold * 100:
+        print(f"{C.YELLOW}⚠ Saliency accuracy {accuracy*100:.2f}% < {threshold*100:.2f}% threshold, training needed.{C.RESET}")
         return True
     print(f"{C.GREEN}✓ Saliency accuracy {accuracy}% >= {threshold}% threshold, skipping saliency training.{C.RESET}")
     return False
@@ -175,7 +151,7 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     
     optimizer = create_optimizer(backbone_frozen)
 
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=rf_model.train_minibatch_size, shuffle=True, num_workers=4)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=rf_model.train_minibatch_size, shuffle=True, num_workers=8)
     data_iter = iter(dataloader)
 
     # Extract run_id from run_dir for logging
@@ -192,6 +168,9 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
         )
         wandb_run.watch(saliency_net)
 
+    def save():
+        save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
+
     num_grad_acc_steps = max(1, rf_model.train_batch_size // rf_model.train_minibatch_size)
     grad_scale = 1.0 / num_grad_acc_steps
     print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Saliency Network ━━━{C.RESET}")
@@ -201,10 +180,11 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}")
     print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}\n")
 
-    save_steps = 256
+    save_steps = 512
     next_save_step = save_steps
 
     accuracy_item = 0.0
+    accuracy_tracker = AccuracyTracker()
 
     progress = tqdm(range(num_steps))
     for step in progress:
@@ -234,37 +214,48 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
 
         optimizer.step()
         gc.collect()
+        
+        # Update accuracy tracker with current measurement
+        accuracy_tracker.update(accuracy_item)
+        smoothed_accuracy = accuracy_tracker.smoothed
 
-        losses = {
-            "saliency_loss": loss_item,
-            "saliency_accuracy": accuracy_item,
-        }
-
-        progress.set_postfix(losses)
+        progress.set_postfix({
+            "loss": loss_item,
+            "acc": f"{accuracy_item*100:.2f}%",
+            "acc_smooth": f"{smoothed_accuracy*100:.2f}%"
+        })
         if wandb_run is not None:
             wlog = {
-                **losses,
+                "saliency_loss": loss_item,
+                "saliency_accuracy": accuracy_item,
+                "saliency_accuracy_smoothed": accuracy_tracker.smoothed,
                 "lr": lr,
             }
             wandb_run.log(wlog)
         
         if step >= next_save_step:
-            save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
+            save()
             next_save_step = step + save_steps
 
-        int_accuracy = int(round(accuracy_item * 100))
-        if backbone_frozen and int_accuracy >= rf_model.saliency_warmup_threshold:
-            print(f"\n{C.BOLD}{C.GREEN}✓ Backbone warmup complete{C.RESET} at step {C.CYAN}{step}{C.RESET}, accuracy {C.BRIGHT_GREEN}{int_accuracy}%{C.RESET}")
+        # Use smoothed accuracy for phase transition checks
+        if backbone_frozen and accuracy_tracker.above_threshold(rf_model.saliency_warmup_threshold):
+            print(f"\n{C.BOLD}{C.GREEN}✓ Backbone warmup complete{C.RESET} at step {C.CYAN}{step}{C.RESET}, smoothed accuracy {C.BRIGHT_GREEN}{smoothed_accuracy*100:.2f}%{C.RESET}")
             saliency_net.unfreeze_backbone()
             # Create new optimizer with differential learning rates
             optimizer = create_optimizer(backbone_frozen=False)
             backbone_frozen = False
-            write_saliency_state(run_dir, accuracy=int_accuracy, backbone_warmed_up=True)
-        elif not backbone_frozen and int_accuracy >= rf_model.saliency_accuracy_threshold:
-            print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Saliency training complete{C.RESET} at step {C.CYAN}{step}{C.RESET}, accuracy {C.BRIGHT_GREEN}{int_accuracy}%{C.RESET}\n")
-            return accuracy_item
+            # Reset tracker when entering new phase
+            accuracy_tracker.reset()
+            save()
+            write_saliency_state(run_dir, accuracy=smoothed_accuracy, backbone_warmed_up=True)
+        elif not backbone_frozen and accuracy_tracker.above_threshold(rf_model.saliency_accuracy_threshold):
+            print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Saliency training complete{C.RESET} at step {C.CYAN}{step}{C.RESET}, smoothed accuracy {C.BRIGHT_GREEN}{smoothed_accuracy*100:.2f}%{C.RESET}\n")
+            save()
+            return accuracy_tracker.smoothed
         
-    return accuracy_item
+    # Training ended without reaching threshold - return smoothed accuracy if available
+    save()
+    return accuracy_tracker.smoothed if accuracy_tracker.is_stable else accuracy_item
 
 
 def train_velocity(model, dataset, run_dir: str, step_start: int, dev: bool):

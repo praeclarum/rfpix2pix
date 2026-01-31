@@ -97,7 +97,7 @@ Models are configured via JSON files. Example (`configs/small.json`):
     "learning_rate": 0.0002,
     "num_inference_steps": 12,
     "timestep_sampling": "logit-normal",
-    "saliency_accuracy_threshold": 90,
+    "saliency_accuracy_threshold": 0.99,
     "velocity_net": {
         "type": "UNet",
         "model_channels": 64,
