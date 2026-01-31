@@ -336,10 +336,6 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     save_steps = 512
     next_save_step = step_start + save_steps
 
-    # Loss tracking for smoothed display
-    loss_window: list[float] = []
-    loss_window_size = 100
-
     progress = tqdm(range(step_start, last_step), initial=step_start, total=last_step - step_start)
     for step in progress:
         optimizer.zero_grad()
@@ -368,21 +364,13 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
         optimizer.step()
         gc.collect()
         
-        # Update loss tracking
-        loss_window.append(loss_item)
-        if len(loss_window) > loss_window_size:
-            loss_window.pop(0)
-        smoothed_loss = sum(loss_window) / len(loss_window)
-
         progress.set_postfix({
             "loss": f"{loss_item:.4f}",
-            "loss_smooth": f"{smoothed_loss:.4f}",
         })
         
         if wandb_run is not None:
             wlog = {
-                "velocity_loss": loss_item,
-                "velocity_loss_smoothed": smoothed_loss,
+                "vel_loss": loss_item,
                 "lr": lr,
                 "step": step,
             }
