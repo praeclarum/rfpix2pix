@@ -10,7 +10,7 @@
     "timestep_sampling": "logit-normal",
     "saliency_learning_rate": 0.00005,
     "saliency_accuracy_threshold": 0.995,
-    "saliency_warmup_threshold": 0.93,
+    "saliency_warmup_threshold": 0.86,
     "saliency_blend_fraction": 0.0,
     "saliency_label_smoothing": 0.1,
     "saliency_augmentations": ["color_jitter", "grayscale", "random_erasing"],

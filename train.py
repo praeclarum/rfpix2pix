@@ -185,7 +185,7 @@ def compute_structure_embeddings(
                 left = (w - crop_size) // 2
                 top = (h - crop_size) // 2
                 img = img.crop((left, top, left + crop_size, top + crop_size))
-                img = img.resize((max_size, max_size), Image.LANCZOS)
+                img = img.resize((max_size, max_size), Image.Resampling.LANCZOS)
                 # Convert to tensor in [-1, 1]
                 arr = np.array(img).astype(np.float32) / 127.5 - 1.0
                 arr = np.transpose(arr, (2, 0, 1))
