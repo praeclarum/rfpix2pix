@@ -58,8 +58,11 @@ def save_module(obj: nn.Module, filename: str):
         "state_dict": obj.state_dict(),
     }
     torch.save(out_dict, filename)
+
+
 def load_module(filename: str, **kwargs) -> nn.Module:
-    in_dict = torch.load(filename)
+    # Load to CPU first for cross-device compatibility (CUDA -> MPS, etc.)
+    in_dict = torch.load(filename, map_location="cpu", weights_only=False)
     obj = object_from_config(in_dict["config"], **kwargs)
     obj.load_state_dict(in_dict["state_dict"])
     return obj

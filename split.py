@@ -73,19 +73,79 @@ Examples:
     return parser.parse_args()
 
 
-def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg', 'jpeg', 'webp']) -> List[str]:
-    """Recursively find all image files in the given directories."""
-    paths = []
-    for directory in directories:
-        dir_path = Path(directory)
-        if not dir_path.exists():
-            print(f"{C.YELLOW}⚠ Directory not found: {directory}{C.RESET}")
-            continue
-        for ext in extensions:
-            paths.extend(str(p) for p in dir_path.rglob(f"*.{ext}"))
-            paths.extend(str(p) for p in dir_path.rglob(f"*.{ext.upper()}"))
-    paths.sort()
-    return paths
+class ProgressiveImageScanner:
+    """
+    Progressively scans directories for images using a queue-based approach.
+    
+    Instead of scanning all directories upfront, this yields images as they're
+    discovered, allowing processing to start immediately while scanning continues.
+    Subdirectories are queued and processed after their parent's images are yielded.
+    """
+    
+    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
+    
+    def __init__(self, directories: List[str]):
+        """
+        Initialize the scanner with a list of starting directories.
+        
+        Args:
+            directories: List of directory paths to scan
+        """
+        from collections import deque
+        self.dir_queue: deque[Path] = deque()
+        self.images_found = 0
+        self.dirs_scanned = 0
+        
+        # Seed the queue with initial directories
+        for d in directories:
+            path = Path(d)
+            if path.exists() and path.is_dir():
+                self.dir_queue.append(path)
+            else:
+                print(f"{C.YELLOW}⚠ Directory not found: {d}{C.RESET}")
+    
+    def __iter__(self):
+        """Iterate over image paths progressively."""
+        return self._scan()
+    
+    def _scan(self):
+        """Generator that yields image paths while progressively scanning directories."""
+        while self.dir_queue:
+            current_dir = self.dir_queue.popleft()
+            self.dirs_scanned += 1
+            
+            try:
+                # List directory contents once
+                entries = list(current_dir.iterdir())
+            except PermissionError:
+                print(f"{C.YELLOW}⚠ Permission denied: {current_dir}{C.RESET}")
+                continue
+            except OSError as e:
+                print(f"{C.YELLOW}⚠ Error reading {current_dir}: {e}{C.RESET}")
+                continue
+            
+            subdirs = []
+            images = []
+            
+            for entry in entries:
+                if entry.is_dir():
+                    subdirs.append(entry)
+                elif entry.is_file() and entry.suffix.lower() in self.IMAGE_EXTENSIONS:
+                    images.append(entry)
+            
+            # Yield images from this directory first
+            for img_path in images:
+                self.images_found += 1
+                yield str(img_path)
+            
+            # Then queue subdirectories for later processing
+            for subdir in sorted(subdirs):
+                self.dir_queue.append(subdir)
+    
+    @property
+    def status(self) -> str:
+        """Return a status string for progress display."""
+        return f"dirs:{self.dirs_scanned} queued:{len(self.dir_queue)}"
 
 
 def get_existing_hashes(output_dir: Path) -> Set[str]:
@@ -186,10 +246,9 @@ def main():
     existing_hashes = get_existing_hashes(output_dir)
     print(f"{C.BLUE}▶ Found {len(existing_hashes)} existing files in output directories{C.RESET}")
     
-    # Find all input images
-    print(f"{C.BLUE}▶ Scanning input directories...{C.RESET}")
-    image_paths = get_image_paths(args.input)
-    print(f"{C.BLUE}▶ Found {len(image_paths)} images to process{C.RESET}")
+    # Progressive image scanner
+    print(f"{C.BLUE}▶ Scanning input directories progressively...{C.RESET}")
+    scanner = ProgressiveImageScanner(args.input)
     
     # Stats
     stats = {
@@ -242,7 +301,7 @@ def main():
         batch_images.clear()
     
     # Process all images with progress bar
-    with tqdm(image_paths, desc="Processing", unit="img") as pbar:
+    with tqdm(scanner, desc="Processing", unit="img") as pbar:
         for path in pbar:
             try:
                 # Compute hash
@@ -274,6 +333,7 @@ def main():
                         "d1": stats["domain1"],
                         "unc": stats["uncertain"],
                         "skip": stats["skipped_duplicate"],
+                        "scan": scanner.status,
                     })
             
             except Exception as e:
