@@ -15,7 +15,7 @@ import wandb.wandb_run
 from PIL import Image
 
 from fnn import object_from_config, load_module, device, save_module
-from data import RFPix2pixDataset, StructurePairing, prepare_structure_pairing
+from data import RFPix2pixDataset, StructurePairing, load_and_preprocess_image, prepare_structure_pairing
 from model import RFPix2pixModel
 from utils import Colors as C, AccuracyTracker
 
@@ -299,7 +299,7 @@ def sample_structure_pairings(
     for d0_idx in tqdm(domain_0_indices, desc="Building proof sheet"):
         # Load domain 0 image
         d0_path = dataset.domain_0_image_paths[d0_idx]
-        d0_image = dataset.load_and_preprocess_image(d0_path)  # (3, H, W)
+        d0_image = load_and_preprocess_image(d0_path, dataset.max_image_size)  # (3, H, W)
         
         # Get top-K domain 1 candidates (already sorted by similarity)
         d1_indices = pairing.top_k_indices[d0_idx]  # (K,)
@@ -308,7 +308,7 @@ def sample_structure_pairings(
         row_images = [d0_image]
         for d1_idx in d1_indices:
             d1_path = dataset.domain_1_image_paths[d1_idx]
-            d1_image = dataset.load_and_preprocess_image(d1_path)  # (3, H, W)
+            d1_image = load_and_preprocess_image(d1_path, dataset.max_image_size)  # (3, H, W)
             row_images.append(d1_image)
         
         # Concatenate horizontally: (3, H, W*(K+1))

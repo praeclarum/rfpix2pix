@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
+from data import load_and_preprocess_image
 from fnn import device, load_module
 from model import RFPix2pixModel
 from utils import Colors as C, compute_file_md5
@@ -381,7 +382,7 @@ def verify_existing(
     for file_path, expected_domain in tqdm(images_to_verify, desc="Verifying", unit="img"):
         try:
             # Load image for inference
-            image_tensor = load_image_for_inference(str(file_path), max_size)
+            image_tensor = load_and_preprocess_image(str(file_path), max_size)
             
             batch_paths.append(file_path)
             batch_domains.append(expected_domain)
@@ -413,30 +414,6 @@ def verify_existing(
     print(f"  Total verified: {total_verified}")
     print(f"  Total moved:    {total_moved}")
     print()
-
-
-def load_image_for_inference(path: str, max_size: int) -> torch.Tensor:
-    """
-    Load and preprocess an image for inference.
-    Center crops to square, resizes, and normalizes to [-1, 1].
-    """
-    image = Image.open(path).convert("RGB")
-    w, h = image.size
-    
-    # Center crop to square
-    crop_size = min(w, h)
-    left = (w - crop_size) // 2
-    top = (h - crop_size) // 2
-    image = image.crop((left, top, left + crop_size, top + crop_size))
-    
-    # Resize to model size
-    image = image.resize((max_size, max_size), Image.LANCZOS)
-    
-    # Normalize to [-1, 1]
-    image_array = np.array(image).astype(np.float32) / 127.5 - 1.0
-    image_array = np.transpose(image_array, (2, 0, 1))  # (H, W, C) -> (C, H, W)
-    
-    return torch.from_numpy(image_array)
 
 
 def classify_batch(
@@ -585,7 +562,7 @@ def main():
                 existing_hashes.add(file_hash)
                 
                 # Load image
-                image = load_image_for_inference(path, max_size)
+                image = load_and_preprocess_image(path, max_size)
                 
                 # Add to batch
                 batch_paths.append(path)

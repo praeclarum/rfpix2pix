@@ -24,60 +24,33 @@ def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg
     paths.sort()
     return paths
 
-
-class StructurePairing:
-    """
-    Structure-aware pairing for velocity training.
-    
-    Given precomputed structure embeddings for both domains, finds
-    structurally similar images across domains using cosine similarity.
-    Enables better velocity training by pairing images with similar
-    composition, pose, and layout.
-    """
-    
-    def __init__(
-        self,
-        embeddings_0: np.ndarray,
-        embeddings_1: np.ndarray,
-        structure_candidates: int = 8,
-    ):
-        """
-        Initialize structure pairing.
-        
-        Args:
-            embeddings_0: (N, D) normalized embeddings for domain 0 images
-            embeddings_1: (M, D) normalized embeddings for domain 1 images
-            structure_candidates: Number of top similar images to consider
-        """
-        self.embeddings_0 = embeddings_0  # (N, D)
-        self.embeddings_1 = embeddings_1  # (M, D)
-        self.structure_candidates = structure_candidates
-        
-        # Precompute similarity matrix: (N, M) = embeddings_0 @ embeddings_1.T
-        # Since embeddings are L2-normalized, dot product = cosine similarity
-        self.similarity_matrix = embeddings_0 @ embeddings_1.T  # (N, M)
-        
-        # Precompute top-K indices for each domain 0 image
-        # This avoids repeated argsort during training
-        k = min(structure_candidates, self.similarity_matrix.shape[1])
-        # argsort in descending order, take top k
-        self.top_k_indices = np.argsort(-self.similarity_matrix, axis=1)[:, :k]  # (N, k)
-    
-    def get_paired_index(self, domain_0_idx: int) -> int:
-        """
-        Get a structurally similar domain 1 index for a domain 0 image.
-        
-        Randomly samples from top-K most similar domain 1 images.
-        
-        Args:
-            domain_0_idx: Index of the domain 0 image
-            
-        Returns:
-            Index of a structurally similar domain 1 image
-        """
-        candidates = self.top_k_indices[domain_0_idx]
-        return int(random.choice(candidates))
-
+def load_and_preprocess_image(path: str, max_size: int) -> torch.Tensor:
+    """Load an image and preprocess it to fit the model requirements."""
+    image = Image.open(path).convert("RGB")
+    src_width, src_height = image.size
+    prescale = 0.9 + 0.1 * random.random()
+    if src_width >= src_height:
+        haspect = min(4/3, src_width / src_height)
+        crop_height = int(src_height * prescale)
+        crop_width = int(crop_height * haspect)
+        if crop_width > src_width:
+            crop_width = src_width
+            crop_height = int(crop_width / haspect)
+    else:
+        vaspect = min(4/3, src_height / src_width)
+        crop_width = int(src_width * prescale)
+        crop_height = int(crop_width * vaspect)
+        if crop_height > src_height:
+            crop_height = src_height
+            crop_width = int(crop_height / vaspect)
+    crop_x = (src_width - crop_width) // 2
+    crop_y = (src_height - crop_height) // 2
+    image = image.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
+    image = image.resize((max_size, max_size), Image.LANCZOS)
+    image_array = np.array(image).astype(np.float32) / 127.5 - 1.0
+    image_array = np.transpose(image_array, (2, 0, 1))
+    image_tensor = torch.from_numpy(image_array)
+    return image_tensor
 
 class RFPix2pixDataset(Dataset):
     def __init__(
@@ -86,7 +59,7 @@ class RFPix2pixDataset(Dataset):
         domain_1_paths: list[str],
         max_size: int,
         num_downsamples: int,
-        structure_pairing: Optional[StructurePairing] = None,
+        structure_pairing: Optional["StructurePairing"] = None,
     ):
         self.domain_0_image_paths = get_image_paths(domain_0_paths)
         self.domain_1_image_paths = get_image_paths(domain_1_paths)
@@ -121,37 +94,10 @@ class RFPix2pixDataset(Dataset):
             domain_1_idx = random.randint(0, len(self.domain_1_image_paths) - 1)
         domain_1_path = self.domain_1_image_paths[domain_1_idx]
         
-        domain_0_image = self.load_and_preprocess_image(domain_0_path)
-        domain_1_image = self.load_and_preprocess_image(domain_1_path)
+        domain_0_image = load_and_preprocess_image(domain_0_path, self.max_image_size)
+        domain_1_image = load_and_preprocess_image(domain_1_path, self.max_image_size)
         return {'domain_0': domain_0_image, 'domain_1': domain_1_image}
     
-    def load_and_preprocess_image(self, path: str) -> torch.Tensor:
-        """Load an image and preprocess it to fit the model requirements."""
-        image = Image.open(path).convert("RGB")
-        src_width, src_height = image.size
-        prescale = 0.9 + 0.1 * random.random()
-        if src_width >= src_height:
-            haspect = min(4/3, src_width / src_height)
-            crop_height = int(src_height * prescale)
-            crop_width = int(crop_height * haspect)
-            if crop_width > src_width:
-                crop_width = src_width
-                crop_height = int(crop_width / haspect)
-        else:
-            vaspect = min(4/3, src_height / src_width)
-            crop_width = int(src_width * prescale)
-            crop_height = int(crop_width * vaspect)
-            if crop_height > src_height:
-                crop_height = src_height
-                crop_width = int(crop_height / vaspect)
-        crop_x = (src_width - crop_width) // 2
-        crop_y = (src_height - crop_height) // 2
-        image = image.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
-        image = image.resize((self.max_image_size, self.max_image_size), Image.LANCZOS)
-        image_array = np.array(image).astype(np.float32) / 127.5 - 1.0
-        image_array = np.transpose(image_array, (2, 0, 1))
-        image_tensor = torch.from_numpy(image_array)
-        return image_tensor
 
 class SaliencyAugmentation(nn.Module):
     """
@@ -250,6 +196,58 @@ class SaliencyAugmentation(nn.Module):
 DINO_TARGET_SIZE = 224
 DINO_PATCH_SIZE = 14
 
+class StructurePairing:
+    """
+    Structure-aware pairing for velocity training.
+    
+    Given precomputed structure embeddings for both domains, finds
+    structurally similar images across domains using cosine similarity.
+    Enables better velocity training by pairing images with similar
+    composition, pose, and layout.
+    """
+    
+    def __init__(
+        self,
+        embeddings_0: np.ndarray,
+        embeddings_1: np.ndarray,
+        structure_candidates: int = 8,
+    ):
+        """
+        Initialize structure pairing.
+        
+        Args:
+            embeddings_0: (N, D) normalized embeddings for domain 0 images
+            embeddings_1: (M, D) normalized embeddings for domain 1 images
+            structure_candidates: Number of top similar images to consider
+        """
+        self.embeddings_0 = embeddings_0  # (N, D)
+        self.embeddings_1 = embeddings_1  # (M, D)
+        self.structure_candidates = structure_candidates
+        
+        # Precompute similarity matrix: (N, M) = embeddings_0 @ embeddings_1.T
+        # Since embeddings are L2-normalized, dot product = cosine similarity
+        self.similarity_matrix = embeddings_0 @ embeddings_1.T  # (N, M)
+        
+        # Precompute top-K indices for each domain 0 image
+        # This avoids repeated argsort during training
+        k = min(structure_candidates, self.similarity_matrix.shape[1])
+        # argsort in descending order, take top k
+        self.top_k_indices = np.argsort(-self.similarity_matrix, axis=1)[:, :k]  # (N, k)
+    
+    def get_paired_index(self, domain_0_idx: int) -> int:
+        """
+        Get a structurally similar domain 1 index for a domain 0 image.
+        
+        Randomly samples from top-K most similar domain 1 images.
+        
+        Args:
+            domain_0_idx: Index of the domain 0 image
+            
+        Returns:
+            Index of a structurally similar domain 1 image
+        """
+        candidates = self.top_k_indices[domain_0_idx]
+        return int(random.choice(candidates))
 
 class StructureEncoder(nn.Module):
     """
