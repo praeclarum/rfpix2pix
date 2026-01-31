@@ -1,4 +1,6 @@
-from typing import List, Callable, Optional, Tuple
+from typing import Dict, List, Callable, Optional, Tuple
+import os
+import gc
 import glob
 import random
 import numpy as np
@@ -7,6 +9,12 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 import torchvision.transforms.v2 as T
 from PIL import Image
+import sqlite3
+from pathlib import Path
+
+from tqdm import tqdm
+
+from utils import compute_file_md5, Colors as C
 
 def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg', 'jpeg']) -> List[str]:
     paths = []
@@ -227,4 +235,432 @@ class SaliencyAugmentation(nn.Module):
         x_out = x_aug * 2.0 - 1.0
         
         return x_out
+
+# DINOv2 constants for embedding computation
+# Use 224 (standard ViT size) for consistent embeddings across runs
+DINO_TARGET_SIZE = 224
+DINO_PATCH_SIZE = 14
+
+
+class StructureEncoder(nn.Module):
+    """
+    Structure encoder using DINOv2 for domain-agnostic image embeddings.
+    
+    Used for structure-aware pairing: finds structurally similar images
+    across domains for better velocity training. Unlike the saliency network
+    which learns domain-discriminative features, DINOv2 provides semantic
+    structure embeddings that capture composition, pose, and layout.
+    
+    The encoder is always frozen (pretrained weights only).
+    """
+    
+    # DINOv2 model variants and their embedding dimensions
+    DINO_MODELS = {
+        "dinov2_vits14": 384,   # Small: 21M params
+        "dinov2_vitb14": 768,   # Base: 86M params
+        "dinov2_vitl14": 1024,  # Large: 300M params
+    }
+    
+    # Type hints for registered buffers
+    imagenet_mean: torch.Tensor
+    imagenet_std: torch.Tensor
+    
+    def __init__(self, model_name: str = "dinov2_vits14"):
+        """
+        Initialize DINOv2 structure encoder.
+        
+        Args:
+            model_name: DINOv2 variant to use. One of:
+                - "dinov2_vits14" (default, 384-dim, fastest)
+                - "dinov2_vitb14" (768-dim)
+                - "dinov2_vitl14" (1024-dim, best quality)
+        """
+        super().__init__()
+        
+        if model_name not in self.DINO_MODELS:
+            raise ValueError(
+                f"Unknown model: {model_name}. "
+                f"Supported: {list(self.DINO_MODELS.keys())}"
+            )
+        
+        self.model_name = model_name
+        self._embedding_dim = self.DINO_MODELS[model_name]
+        
+        # Register ImageNet normalization constants as buffers
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+        
+        # Load DINOv2 model from torch.hub (downloads on first use)
+        dino_model = torch.hub.load(
+            "facebookresearch/dinov2",
+            model_name,
+            pretrained=True,
+        )
+        assert isinstance(dino_model, nn.Module)
+        self.model: nn.Module = dino_model
+        
+        # Freeze all parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.eval()
+    
+    @property
+    def embedding_dim(self) -> int:
+        """Dimension of the output embedding vectors."""
+        return self._embedding_dim
+    
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert from app's [-1, 1] colorspace to ImageNet normalization."""
+        x_01 = (x + 1.0) / 2.0
+        x_normalized = (x_01 - self.imagenet_mean) / self.imagenet_std
+        return x_normalized
+    
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode images to structure embeddings.
+        
+        Args:
+            x: (B, 3, H, W) input images in [-1, 1] range
+            
+        Returns:
+            (B, embedding_dim) normalized embedding vectors
+        """
+        x_normalized = self._normalize_input(x)
+        
+        # DINOv2 returns CLS token embedding
+        embeddings = self.model(x_normalized)  # (B, embedding_dim)
+        
+        # L2 normalize for cosine similarity
+        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        
+        return embeddings
+
+
+def get_cache_dir() -> Path:
+    """Get the cache directory, respecting RFPIX2PIX_CACHE_DIR env var."""
+    cache_dir = os.environ.get("RFPIX2PIX_CACHE_DIR")
+    if cache_dir:
+        return Path(cache_dir)
+    return Path.home() / ".cache" / "rfpix2pix"
+
+
+class EmbeddingCache:
+    """
+    SQLite-backed cache for image structure embeddings.
+    
+    Maps image MD5 hashes to embedding vectors. Thread-safe for reads,
+    uses write-ahead logging for concurrent access across processes.
+    """
+    
+    def __init__(self, db_name: str = "dino_embeddings.db"):
+        """
+        Initialize the embedding cache.
+        
+        Args:
+            db_name: Name of the SQLite database file.
+        """
+        cache_dir = get_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = cache_dir / db_name
+        
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize the database schema."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    md5 TEXT PRIMARY KEY,
+                    embedding BLOB NOT NULL
+                )
+            """)
+            # Enable WAL mode for better concurrent access
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a database connection."""
+        return sqlite3.connect(str(self.db_path))
+    
+    def get(self, md5: str) -> Optional[np.ndarray]:
+        """
+        Get an embedding by MD5 hash.
+        
+        Args:
+            md5: MD5 hash of the image file.
+            
+        Returns:
+            Embedding vector as numpy array, or None if not found.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT embedding FROM embeddings WHERE md5 = ?",
+                (md5.lower(),)
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return np.frombuffer(row[0], dtype=np.float32)
+        finally:
+            conn.close()
+    
+    def put(self, md5: str, embedding: np.ndarray):
+        """
+        Store an embedding.
+        
+        Args:
+            md5: MD5 hash of the image file.
+            embedding: Embedding vector as numpy array.
+        """
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings (md5, embedding) VALUES (?, ?)",
+                (md5.lower(), embedding.astype(np.float32).tobytes())
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def get_batch(self, md5_list: List[str]) -> Dict[str, np.ndarray]:
+        """
+        Get multiple embeddings by MD5 hash.
+        
+        Args:
+            md5_list: List of MD5 hashes to look up.
+            
+        Returns:
+            Dict mapping found MD5s to their embeddings.
+        """
+        if not md5_list:
+            return {}
+        
+        conn = self._get_connection()
+        try:
+            # Use parameterized query with IN clause
+            placeholders = ",".join("?" * len(md5_list))
+            cursor = conn.execute(
+                f"SELECT md5, embedding FROM embeddings WHERE md5 IN ({placeholders})",
+                [m.lower() for m in md5_list]
+            )
+            result = {}
+            for row in cursor:
+                result[row[0]] = np.frombuffer(row[1], dtype=np.float32)
+            return result
+        finally:
+            conn.close()
+    
+    def put_batch(self, embeddings: Dict[str, np.ndarray]):
+        """
+        Store multiple embeddings.
+        
+        Args:
+            embeddings: Dict mapping MD5 hashes to embedding vectors.
+        """
+        if not embeddings:
+            return
+        
+        conn = self._get_connection()
+        try:
+            conn.executemany(
+                "INSERT OR REPLACE INTO embeddings (md5, embedding) VALUES (?, ?)",
+                [(md5.lower(), emb.astype(np.float32).tobytes()) for md5, emb in embeddings.items()]
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def __len__(self) -> int:
+        """Return the number of cached embeddings."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute("SELECT COUNT(*) FROM embeddings")
+            return cursor.fetchone()[0]
+        finally:
+            conn.close()
+    
+    def __repr__(self) -> str:
+        return f"EmbeddingCache({self.db_path}, {len(self)} entries)"
+
+def compute_structure_embeddings(
+    image_paths: list[str],
+    encoder: StructureEncoder,
+    cache: EmbeddingCache,
+    device: torch.device,
+    batch_size: int = 16,
+    desc: str = "Computing embeddings",
+) -> np.ndarray:
+    """
+    Compute structure embeddings for a list of images.
+    
+    Uses the embedding cache to avoid recomputing embeddings for images
+    that have been processed in previous runs.
+    
+    Images are resized preserving aspect ratio (short side = 224), then
+    minimally cropped to ensure dimensions are multiples of 14 for DINOv2.
+    
+    Args:
+        image_paths: List of image file paths
+        encoder: StructureEncoder (DINOv2) model
+        cache: EmbeddingCache for persistent storage
+        batch_size: Batch size for encoding
+        desc: Description for progress bar
+        
+    Returns:
+        (N, D) array of embeddings, one per image path (in order)
+    """
+    import numpy as np
+    from PIL import Image
+    
+    n_images = len(image_paths)
+    embedding_dim = encoder.embedding_dim
+    
+    # Compute MD5 hashes for all images
+    print(f"{C.DIM}  Computing file hashes...{C.RESET}")
+    md5_hashes = [compute_file_md5(p) for p in tqdm(image_paths, desc="Hashing")]
+    
+    # Check cache for existing embeddings
+    cached = cache.get_batch(md5_hashes)
+    
+    # Identify which images need computation
+    needs_compute = []
+    for i, md5 in enumerate(md5_hashes):
+        if md5 not in cached:
+            needs_compute.append(i)
+    
+    n_cached = n_images - len(needs_compute)
+    n_to_compute = len(needs_compute)
+    print(f"{C.DIM}  Found {C.CYAN}{n_cached}{C.RESET}{C.DIM} cached, need to compute {C.CYAN}{n_to_compute}{C.RESET}")
+    
+    # Compute missing embeddings
+    if needs_compute:
+        new_embeddings = {}
+        
+        # Process in batches
+        for batch_start in tqdm(range(0, len(needs_compute), batch_size), desc=desc):
+            batch_indices = needs_compute[batch_start:batch_start + batch_size]
+            
+            # Load and preprocess images
+            batch_tensors = []
+            for idx in batch_indices:
+                path = image_paths[idx]
+                img = Image.open(path).convert("RGB")
+                
+                # Resize preserving aspect ratio (short side = DINO_TARGET_SIZE)
+                w, h = img.size
+                if w < h:
+                    new_w = DINO_TARGET_SIZE
+                    new_h = int(h * DINO_TARGET_SIZE / w)
+                else:
+                    new_h = DINO_TARGET_SIZE
+                    new_w = int(w * DINO_TARGET_SIZE / h)
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                
+                # Minimally crop to make dimensions multiples of DINO_PATCH_SIZE
+                w, h = img.size
+                crop_w = (w // DINO_PATCH_SIZE) * DINO_PATCH_SIZE
+                crop_h = (h // DINO_PATCH_SIZE) * DINO_PATCH_SIZE
+                left = (w - crop_w) // 2
+                top = (h - crop_h) // 2
+                img = img.crop((left, top, left + crop_w, top + crop_h))
+                # Convert to tensor in [-1, 1]
+                arr = np.array(img).astype(np.float32) / 127.5 - 1.0
+                arr = np.transpose(arr, (2, 0, 1))
+                batch_tensors.append(torch.from_numpy(arr))
+            
+            batch = torch.stack(batch_tensors).to(device)
+            
+            # Encode
+            with torch.no_grad():
+                embeddings = encoder(batch).cpu().numpy()
+            
+            # Store in cache
+            for i, idx in enumerate(batch_indices):
+                md5 = md5_hashes[idx]
+                new_embeddings[md5] = embeddings[i]
+        
+        # Batch write to cache
+        cache.put_batch(new_embeddings)
+        
+        # Merge with cached
+        cached.update(new_embeddings)
+    
+    # Build output array in original order
+    result = np.zeros((n_images, embedding_dim), dtype=np.float32)
+    for i, md5 in enumerate(md5_hashes):
+        result[i] = cached[md5]
+    
+    return result
+
+
+def prepare_structure_pairing(
+    dataset: RFPix2pixDataset,
+    structure_candidates: int,
+    device: torch.device,
+) -> StructurePairing:
+    """
+    Prepare structure pairing by computing embeddings for both domains.
+    
+    Args:
+        dataset: Dataset with image paths for both domains
+        structure_candidates: Number of similar images to consider for pairing
+        
+    Returns:
+        StructurePairing object ready for use in dataset
+    """
+    print(f"\n{C.BOLD}{C.MAGENTA}━━━ Computing Structure Embeddings ━━━{C.RESET}")
+    
+    # Initialize encoder and cache
+    print(f"{C.DIM}  Loading DINOv2 encoder...{C.RESET}")
+    encoder = StructureEncoder().to(device)
+    cache = EmbeddingCache()
+    print(f"{C.DIM}  Cache: {cache}{C.RESET}")
+    
+    # Compute embeddings for both domains
+    print(f"\n{C.BRIGHT_CYAN}  Domain 0:{C.RESET} {len(dataset.domain_0_image_paths)} images")
+    embeddings_0 = compute_structure_embeddings(
+        dataset.domain_0_image_paths,
+        encoder,
+        cache,
+        device,
+        desc="Domain 0",
+    )
+    
+    print(f"\n{C.BRIGHT_CYAN}  Domain 1:{C.RESET} {len(dataset.domain_1_image_paths)} images")
+    embeddings_1 = compute_structure_embeddings(
+        dataset.domain_1_image_paths,
+        encoder,
+        cache,
+        device,
+        desc="Domain 1",
+    )
+    
+    # Create pairing object
+    pairing = StructurePairing(
+        embeddings_0=embeddings_0,
+        embeddings_1=embeddings_1,
+        structure_candidates=structure_candidates,
+    )
+    
+    print(f"\n{C.GREEN}✓ Structure pairing ready{C.RESET} (top-{structure_candidates} candidates per image)\n")
+    
+    # Clean up encoder from GPU
+    del encoder
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return pairing
+
 
