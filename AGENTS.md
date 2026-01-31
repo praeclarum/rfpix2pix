@@ -37,6 +37,8 @@ Training happens in two phases:
 
 The saliency network `h(x)` is a domain classifier (e.g., ResNet-based) that learns to distinguish images from domain 0 vs domain 1. Its latent features and gradients are used to weight the velocity loss.
 
+**Blend Training** (optional): Set `saliency_blend_fraction` (0.0 to 1.0) to expose the classifier to interpolated images `x_t = t*x1 + (1-t)*x0` during training. This uses soft cross-entropy with targets `[1-t, t]`, which degenerates to hard labels at t=0 or t=1. The goal is to improve Jacobian quality at intermediate timesteps during velocity training.
+
 This phase has two sub-phases for pretrained backbones:
 
 1. **Backbone Warmup** (frozen backbone): Train only the head layers (`latent_proj`, `classifier`) until accuracy reaches `saliency_warmup_threshold`. This prevents random gradients from corrupting pretrained weights.

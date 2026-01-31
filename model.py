@@ -21,6 +21,7 @@ class RFPix2pixModel(nn.Module):
         saliency_net: Config,
         saliency_accuracy_threshold: float,
         saliency_warmup_threshold: float,
+        saliency_blend_fraction: float = 0.0,
     ):
         super().__init__()
         self.max_size = max_size
@@ -33,6 +34,7 @@ class RFPix2pixModel(nn.Module):
         self.timestep_sampling = timestep_sampling
         self.saliency_accuracy_threshold = saliency_accuracy_threshold
         self.saliency_warmup_threshold = saliency_warmup_threshold
+        self.saliency_blend_fraction = saliency_blend_fraction
         self.velocity_net = object_from_config(
             velocity_net,
             input_channels=3,
@@ -79,43 +81,91 @@ class RFPix2pixModel(nn.Module):
         The saliency network learns to distinguish domain 0 from domain 1.
         This provides meaningful gradients for the style-transfer loss.
         
+        Supports blended training: a fraction of the batch uses interpolated
+        images x_t = t*x1 + (1-t)*x0 with soft labels [1-t, t]. This exposes
+        the classifier to the same distribution it will see during velocity
+        training, potentially improving Jacobian quality.
+        
         Args:
             x0: (B, 3, H, W) images from domain 0
             x1: (B, 3, H, W) images from domain 1
             
         Returns:
             dict with:
-                - loss: scalar cross-entropy loss
-                - logits_0: (B, num_classes) logits for domain 0
-                - logits_1: (B, num_classes) logits for domain 1
-                - accuracy: classification accuracy
+                - loss: scalar soft cross-entropy loss
+                - accuracy: classification accuracy (argmax vs majority domain)
         """
         B = x0.shape[0]
+        device = x0.device
+        dtype = x0.dtype
         
-        # Get classification logits for both domains
-        logits_0 = self.get_saliency(x0)  # (B, num_classes)
-        logits_1 = self.get_saliency(x1)  # (B, num_classes)
+        # Determine how many samples use blended interpolation vs pure domains
+        num_blends = int(B * self.saliency_blend_fraction)
+        num_pure = B - num_blends
         
-        # Concatenate logits and create labels
-        # Domain 0 -> label 0, Domain 1 -> label 1
-        logits = torch.cat([logits_0, logits_1], dim=0)  # (2B, num_classes)
-        labels = torch.cat([
-            torch.zeros(B, dtype=torch.long, device=x0.device),
-            torch.ones(B, dtype=torch.long, device=x1.device),
-        ], dim=0)  # (2B,)
+        # Construct t values for all 2B samples:
+        # - First num_pure samples from x0: t=0 (pure domain 0)
+        # - First num_pure samples from x1: t=1 (pure domain 1)  
+        # - Remaining num_blends from each: t sampled (blended)
+        t_parts = []
         
-        # Cross-entropy loss
-        loss = F.cross_entropy(logits, labels)
+        # Pure domain 0 samples (t=0)
+        if num_pure > 0:
+            t_parts.append(torch.zeros(num_pure, device=device, dtype=dtype))
         
-        # Compute accuracy for monitoring
+        # Pure domain 1 samples (t=1)
+        if num_pure > 0:
+            t_parts.append(torch.ones(num_pure, device=device, dtype=dtype))
+        
+        # Blended samples (t sampled from model's timestep distribution)
+        if num_blends > 0:
+            # Sample t for blends applied to both x0 and x1 slices
+            t_blends = self.sample_timestep(num_blends * 2, device, dtype)
+            t_parts.append(t_blends)
+        
+        t = torch.cat(t_parts, dim=0)  # (2B,)
+        
+        # Construct input images: concatenate pure and blended from both domains
+        x0_parts = []
+        x1_parts = []
+        
+        if num_pure > 0:
+            x0_parts.append(x0[:num_pure])  # Pure domain 0
+            x1_parts.append(x1[:num_pure])  # Pure domain 1
+        
+        if num_blends > 0:
+            x0_parts.append(x0[num_pure:])  # Will be blended
+            x0_parts.append(x0[num_pure:])  # Second set for blending
+            x1_parts.append(x1[num_pure:])  # Will be blended
+            x1_parts.append(x1[num_pure:])  # Second set for blending
+        
+        x0_all = torch.cat(x0_parts, dim=0)  # (2B, 3, H, W)
+        x1_all = torch.cat(x1_parts, dim=0)  # (2B, 3, H, W)
+        
+        # Compute interpolated images: x_t = t*x1 + (1-t)*x0
+        t_broadcast = t[:, None, None, None]  # (2B, 1, 1, 1)
+        x_t = t_broadcast * x1_all + (1 - t_broadcast) * x0_all  # (2B, 3, H, W)
+        
+        # Get classification logits
+        logits = self.get_saliency(x_t)  # (2B, num_classes)
+        
+        # Soft targets: [1-t, t] for each sample
+        # At t=0: [1, 0] = domain 0, at t=1: [0, 1] = domain 1
+        soft_targets = torch.stack([1 - t, t], dim=1)  # (2B, 2)
+        
+        # Soft cross-entropy loss: -sum(targets * log_softmax(logits), dim=1)
+        # This generalizes standard CE: at t=0 or t=1, it equals hard CE
+        log_probs = F.log_softmax(logits, dim=1)  # (2B, 2)
+        loss = -torch.sum(soft_targets * log_probs, dim=1).mean()
+        
+        # Compute accuracy for monitoring: compare argmax to majority domain
         with torch.no_grad():
-            preds = logits.argmax(dim=1)
+            preds = logits.argmax(dim=1)  # (2B,)
+            labels = (t > 0.5).long()     # Majority domain
             accuracy = (preds == labels).float().mean()
         
         return {
             "loss": loss,
-            "logits_0": logits_0,
-            "logits_1": logits_1,
             "accuracy": accuracy,
         }
 
