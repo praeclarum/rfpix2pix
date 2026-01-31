@@ -133,7 +133,7 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     num_steps = rf_model.train_images // rf_model.train_batch_size
     last_step = num_steps
     
-    lr = rf_model.learning_rate
+    lr = rf_model.saliency_learning_rate
     
     # Check if backbone warmup was already completed (resuming training)
     backbone_already_warmed = is_backbone_warmed_up(run_dir)

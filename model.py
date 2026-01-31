@@ -25,6 +25,7 @@ class RFPix2pixModel(nn.Module):
         saliency_blend_fraction: float = 0.0,
         saliency_label_smoothing: float = 0.0,
         saliency_augmentations: List[str] = [],
+        saliency_learning_rate: Optional[float] = None,
     ):
         super().__init__()
         self.max_size = max_size
@@ -41,6 +42,7 @@ class RFPix2pixModel(nn.Module):
         self.saliency_label_smoothing = saliency_label_smoothing
         self.saliency_augmentations = saliency_augmentations
         self.saliency_augment = SaliencyAugmentation(saliency_augmentations)
+        self.saliency_learning_rate = saliency_learning_rate if saliency_learning_rate is not None else learning_rate
         self.velocity_net = object_from_config(
             velocity_net,
             input_channels=3,
@@ -131,19 +133,29 @@ class RFPix2pixModel(nn.Module):
         
         t = torch.cat(t_parts, dim=0)  # (2B,)
         
-        # Construct input images: concatenate pure and blended from both domains
+        # Construct input images for interpolation x_t = t*x1 + (1-t)*x0
+        # Each t value needs a corresponding (x0, x1) pair:
+        # - At t=0: x_t = x0 (domain 0 images)
+        # - At t=1: x_t = x1 (domain 1 images)
+        # - At t in (0,1): x_t = blend
         x0_parts = []
         x1_parts = []
         
         if num_pure > 0:
-            x0_parts.append(x0[:num_pure])  # Pure domain 0
-            x1_parts.append(x1[:num_pure])  # Pure domain 1
+            # Domain 0 samples (t=0): x_t = 0*x1 + 1*x0 = x0
+            x0_parts.append(x0[:num_pure])
+            x1_parts.append(x1[:num_pure])  # Doesn't matter, multiplied by 0
+            
+            # Domain 1 samples (t=1): x_t = 1*x1 + 0*x0 = x1
+            x0_parts.append(x0[:num_pure])  # Doesn't matter, multiplied by 0
+            x1_parts.append(x1[:num_pure])
         
         if num_blends > 0:
-            x0_parts.append(x0[num_pure:])  # Will be blended
-            x0_parts.append(x0[num_pure:])  # Second set for blending
-            x1_parts.append(x1[num_pure:])  # Will be blended
-            x1_parts.append(x1[num_pure:])  # Second set for blending
+            # Blended samples: need proper (x0, x1) pairs
+            x0_parts.append(x0[num_pure:])
+            x0_parts.append(x0[num_pure:])
+            x1_parts.append(x1[num_pure:])
+            x1_parts.append(x1[num_pure:])
         
         x0_all = torch.cat(x0_parts, dim=0)  # (2B, 3, H, W)
         x1_all = torch.cat(x1_parts, dim=0)  # (2B, 3, H, W)
