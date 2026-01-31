@@ -1,12 +1,18 @@
+from collections import defaultdict
+import gc
 from typing import Optional
 import argparse
 import os
 import sys
 import json
 import datetime
-import torch
 
-from fnn import object_from_config, load_module, device
+import torch
+from tqdm import tqdm
+import wandb
+import wandb.wandb_run
+
+from fnn import object_from_config, load_module, device, save_module
 from data import RFPix2pixDataset
 from model import RFPix2pixModel
 
@@ -112,14 +118,130 @@ def is_backbone_warmed_up(run_dir: str) -> bool:
     return state["backbone_warmed_up"]
 
 
-def train_saliency(model, dataset, run_dir: str, dev: bool) -> float:
+def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, dev: bool) -> float:
     """
     Train the saliency network until it reaches acceptable accuracy.
     
     Returns:
         Final accuracy as a float (0.0 to 1.0)
     """
-    raise NotImplementedError("Training function is not yet implemented.")
+    rf_model.train_saliency()
+    rf_model.to(device)
+
+    saliency_net = rf_model.saliency_net
+
+    num_steps = rf_model.train_images // rf_model.train_batch_size
+    
+    lr = rf_model.learning_rate
+    saliency_net.freeze_backbone()
+    frozen_backbone_optimizer: torch.optim.AdamW = torch.optim.AdamW(
+        saliency_net.parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        weight_decay=1e-4,
+    )
+    full_optimizer: Optional[torch.optim.AdamW] = None
+
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=rf_model.train_minibatch_size, shuffle=True, num_workers=4)
+    data_iter = iter(dataloader)
+
+    run_dir = os.path.join("runs", run_id)
+    os.makedirs(run_dir, exist_ok=True)
+
+    if dev:
+        wandb_run: Optional[wandb.wandb_run.Run] = None
+    else:
+        wandb_run: Optional[wandb.wandb_run.Run] = wandb.init(
+            project="rfpix2pix_saliency",
+            save_code=True,
+            id=run_id,
+            config=rf_model.__config,  # pyright: ignore[reportArgumentType]
+        )
+        wandb_run.watch(saliency_net)
+
+    num_grad_acc_steps = max(1, rf_model.train_batch_size // rf_model.train_minibatch_size)
+    grad_scale = 1.0 / num_grad_acc_steps
+    print(f"Training saliency model for {num_steps} steps")
+    print(f"  minibatch size: {rf_model.train_minibatch_size}")
+    print(f"  grad acc steps: {num_grad_acc_steps}")
+    print(f"  learning rate: {lr}")
+
+    sample_steps = 16
+    max_sample_steps = 128
+    next_sample_step = sample_steps
+    save_steps = 256
+    next_save_step = save_steps
+
+    accuracy_item = 0.0
+
+    progress = tqdm(range(num_steps))
+    for this_step in progress:
+        step = step_start + this_step
+        optimizer = full_optimizer
+        backbone_frozen = False
+        if optimizer is None:
+            backbone_frozen = True
+            optimizer = frozen_backbone_optimizer
+        optimizer.zero_grad()
+        
+        loss_item = 0.0
+        accuracy_item = 0.0
+        
+        for grad_step in range(num_grad_acc_steps):
+            # Get data batch
+            try:
+                inputs = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                inputs = next(data_iter)
+            
+            input_domain_0 = inputs["domain_0"].to(device)  # (B, 3, H, W)
+            input_domain_1 = inputs["domain_1"].to(device)  # (B, 3, H, W)
+            
+            output = rf_model.compute_saliency_loss(input_domain_0, input_domain_1)
+            loss = output['loss']
+            grad_loss: torch.Tensor = loss * grad_scale
+            grad_loss.backward()
+
+            accuracy_item += output['accuracy'].item() * grad_scale
+            loss_item += grad_loss.item()
+
+        optimizer.step()
+        gc.collect()
+
+        losses = {
+            "saliency_loss": loss_item,
+            "saliency_accuracy": accuracy_item,
+        }
+
+        progress.set_postfix(losses)
+        if wandb_run is not None:
+            wlog = {
+                **losses,
+                "lr": lr,
+            }
+            wandb_run.log(wlog)
+        
+        if step >= next_save_step:
+            save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
+            next_save_step = step + save_steps
+
+        int_accuracy = int(round(accuracy_item * 100))
+        if backbone_frozen and int_accuracy >= rf_model.saliency_warmup_threshold:
+            print(f"Saliency backbone warmup complete at step {step}, accuracy {int_accuracy}%")
+            saliency_net.unfreeze_backbone()
+            full_optimizer = torch.optim.AdamW(
+                saliency_net.parameters(),
+                lr=lr,
+                betas=(0.9, 0.999),
+                weight_decay=1e-4,
+            )
+            write_saliency_state(run_dir, accuracy=int_accuracy, backbone_warmed_up=True)
+        elif not backbone_frozen and int_accuracy >= rf_model.saliency_accuracy_threshold:
+            print(f"Saliency training complete at step {step}, accuracy {int_accuracy}%")
+            return accuracy_item
+        
+    return accuracy_item
 
 
 def train_velocity(model, dataset, run_dir: str, step_start: int, dev: bool):
