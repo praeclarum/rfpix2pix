@@ -116,14 +116,32 @@ Models are configured via JSON files. Example (`configs/small.json`):
 | `learning_rate` | Optimizer learning rate |
 | `num_inference_steps` | ODE integration steps during inference |
 | `saliency_accuracy_threshold` | Required classifier accuracy before velocity training |
+| `structure_pairing` | Enable structure-aware image pairing (default: false) |
+| `structure_candidates` | Number of similar images to consider for pairing (default: 8) |
 
 ## Training Phases
 
 1. **Phase 1: Saliency Training**  
    Trains the classifier to distinguish domain 0 from domain 1 until it reaches the accuracy threshold.
 
-2. **Phase 2: Velocity Training**  
-   Freezes the saliency network and trains the velocity field using the saliency-weighted loss.
+2. **Phase 1.5: Structure Embedding** (if `structure_pairing` is enabled)  
+   Computes DINOv2 embeddings for all images in both domains. Embeddings are cached globally in `~/.cache/rfpix2pix/` to avoid recomputation across runs.
+
+3. **Phase 2: Velocity Training**  
+   Freezes the saliency network and trains the velocity field using the saliency-weighted loss. If structure pairing is enabled, domain-1 images are selected from the top `structure_candidates` most structurally similar images for each domain-0 sample.
+
+### Structure-Aware Pairing
+
+For datasets with diverse compositions (e.g., close-ups vs wide shots), enabling `structure_pairing` can improve training by matching images with similar layouts across domains. This uses DINOv2 embeddings to find structurally similar images, avoiding mismatched pairs like a horse close-up being paired with a distant zebra.
+
+```json
+{
+    "structure_pairing": true,
+    "structure_candidates": 16
+}
+```
+
+Higher `structure_candidates` values provide more variety but less strict matching. Lower values enforce stricter structural similarity.
 
 ## Hardware Support
 

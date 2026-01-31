@@ -1,5 +1,15 @@
 # Terminal colors
+import hashlib
 from collections import deque
+
+
+def compute_file_md5(file_path: str) -> str:
+    """Compute MD5 hash of a file's contents."""
+    hasher = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            hasher.update(chunk)
+    return hasher.hexdigest().lower()
 
 
 class Colors:

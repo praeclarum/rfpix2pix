@@ -26,6 +26,8 @@ class RFPix2pixModel(nn.Module):
         saliency_label_smoothing: float = 0.0,
         saliency_augmentations: List[str] = [],
         saliency_learning_rate: Optional[float] = None,
+        structure_pairing: bool = False,
+        structure_candidates: int = 8,
     ):
         super().__init__()
         self.max_size = max_size
@@ -43,6 +45,8 @@ class RFPix2pixModel(nn.Module):
         self.saliency_augmentations = saliency_augmentations
         self.saliency_augment = SaliencyAugmentation(saliency_augmentations)
         self.saliency_learning_rate = saliency_learning_rate if saliency_learning_rate is not None else learning_rate
+        self.structure_pairing = structure_pairing
+        self.structure_candidates = structure_candidates
         self.velocity_net = object_from_config(
             velocity_net,
             input_channels=3,
@@ -674,3 +678,105 @@ class ResNetSaliencyNet(SaliencyNet):
         return logits
 
 register_type("ResNetSaliencyNet", ResNetSaliencyNet)
+
+
+class StructureEncoder(nn.Module):
+    """
+    Structure encoder using DINOv2 for domain-agnostic image embeddings.
+    
+    Used for structure-aware pairing: finds structurally similar images
+    across domains for better velocity training. Unlike the saliency network
+    which learns domain-discriminative features, DINOv2 provides semantic
+    structure embeddings that capture composition, pose, and layout.
+    
+    The encoder is always frozen (pretrained weights only).
+    """
+    
+    # DINOv2 model variants and their embedding dimensions
+    DINO_MODELS = {
+        "dinov2_vits14": 384,   # Small: 21M params
+        "dinov2_vitb14": 768,   # Base: 86M params
+        "dinov2_vitl14": 1024,  # Large: 300M params
+    }
+    
+    # Type hints for registered buffers
+    imagenet_mean: torch.Tensor
+    imagenet_std: torch.Tensor
+    
+    def __init__(self, model_name: str = "dinov2_vits14"):
+        """
+        Initialize DINOv2 structure encoder.
+        
+        Args:
+            model_name: DINOv2 variant to use. One of:
+                - "dinov2_vits14" (default, 384-dim, fastest)
+                - "dinov2_vitb14" (768-dim)
+                - "dinov2_vitl14" (1024-dim, best quality)
+        """
+        super().__init__()
+        
+        if model_name not in self.DINO_MODELS:
+            raise ValueError(
+                f"Unknown model: {model_name}. "
+                f"Supported: {list(self.DINO_MODELS.keys())}"
+            )
+        
+        self.model_name = model_name
+        self._embedding_dim = self.DINO_MODELS[model_name]
+        
+        # Register ImageNet normalization constants as buffers
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        )
+        
+        # Load DINOv2 model from torch.hub (downloads on first use)
+        dino_model = torch.hub.load(
+            "facebookresearch/dinov2",
+            model_name,
+            pretrained=True,
+        )
+        assert isinstance(dino_model, nn.Module)
+        self.model: nn.Module = dino_model
+        
+        # Freeze all parameters
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.eval()
+    
+    @property
+    def embedding_dim(self) -> int:
+        """Dimension of the output embedding vectors."""
+        return self._embedding_dim
+    
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert from app's [-1, 1] colorspace to ImageNet normalization."""
+        x_01 = (x + 1.0) / 2.0
+        x_normalized = (x_01 - self.imagenet_mean) / self.imagenet_std
+        return x_normalized
+    
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode images to structure embeddings.
+        
+        Args:
+            x: (B, 3, H, W) input images in [-1, 1] range
+            
+        Returns:
+            (B, embedding_dim) normalized embedding vectors
+        """
+        x_normalized = self._normalize_input(x)
+        
+        # DINOv2 returns CLS token embedding
+        embeddings = self.model(x_normalized)  # (B, embedding_dim)
+        
+        # L2 normalize for cosine similarity
+        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        
+        return embeddings
+

@@ -7,6 +7,7 @@ import json
 import datetime
 import shutil
 
+import numpy as np
 import torch
 from tqdm import tqdm
 import wandb
@@ -14,11 +15,10 @@ import wandb.wandb_run
 from PIL import Image
 
 from fnn import object_from_config, load_module, device, save_module
-from data import RFPix2pixDataset
-from model import RFPix2pixModel
-
-from utils import Colors as C
-from utils import AccuracyTracker
+from data import RFPix2pixDataset, StructurePairing
+from model import RFPix2pixModel, StructureEncoder
+from embedding_cache import EmbeddingCache
+from utils import Colors as C, AccuracyTracker, compute_file_md5
 
 SALIENCY_STATE_FILE = "saliency_state.json"
 
@@ -116,6 +116,165 @@ def is_backbone_warmed_up(run_dir: str) -> bool:
     """
     state = read_saliency_state(run_dir)
     return state["backbone_warmed_up"]
+
+
+def compute_structure_embeddings(
+    image_paths: list[str],
+    encoder: StructureEncoder,
+    cache: EmbeddingCache,
+    max_size: int,
+    batch_size: int = 16,
+    desc: str = "Computing embeddings",
+) -> np.ndarray:
+    """
+    Compute structure embeddings for a list of images.
+    
+    Uses the embedding cache to avoid recomputing embeddings for images
+    that have been processed in previous runs.
+    
+    Args:
+        image_paths: List of image file paths
+        encoder: StructureEncoder (DINOv2) model
+        cache: EmbeddingCache for persistent storage
+        max_size: Image size to resize to
+        batch_size: Batch size for encoding
+        desc: Description for progress bar
+        
+    Returns:
+        (N, D) array of embeddings, one per image path (in order)
+    """
+    import numpy as np
+    from PIL import Image
+    
+    n_images = len(image_paths)
+    embedding_dim = encoder.embedding_dim
+    
+    # Compute MD5 hashes for all images
+    print(f"{C.DIM}  Computing file hashes...{C.RESET}")
+    md5_hashes = [compute_file_md5(p) for p in tqdm(image_paths, desc="Hashing")]
+    
+    # Check cache for existing embeddings
+    cached = cache.get_batch(md5_hashes)
+    
+    # Identify which images need computation
+    needs_compute = []
+    for i, md5 in enumerate(md5_hashes):
+        if md5 not in cached:
+            needs_compute.append(i)
+    
+    n_cached = n_images - len(needs_compute)
+    n_to_compute = len(needs_compute)
+    print(f"{C.DIM}  Found {C.CYAN}{n_cached}{C.RESET}{C.DIM} cached, need to compute {C.CYAN}{n_to_compute}{C.RESET}")
+    
+    # Compute missing embeddings
+    if needs_compute:
+        new_embeddings = {}
+        
+        # Process in batches
+        for batch_start in tqdm(range(0, len(needs_compute), batch_size), desc=desc):
+            batch_indices = needs_compute[batch_start:batch_start + batch_size]
+            
+            # Load and preprocess images
+            batch_tensors = []
+            for idx in batch_indices:
+                path = image_paths[idx]
+                img = Image.open(path).convert("RGB")
+                # Center crop to square, then resize
+                w, h = img.size
+                crop_size = min(w, h)
+                left = (w - crop_size) // 2
+                top = (h - crop_size) // 2
+                img = img.crop((left, top, left + crop_size, top + crop_size))
+                img = img.resize((max_size, max_size), Image.LANCZOS)
+                # Convert to tensor in [-1, 1]
+                arr = np.array(img).astype(np.float32) / 127.5 - 1.0
+                arr = np.transpose(arr, (2, 0, 1))
+                batch_tensors.append(torch.from_numpy(arr))
+            
+            batch = torch.stack(batch_tensors).to(device)
+            
+            # Encode
+            with torch.no_grad():
+                embeddings = encoder(batch).cpu().numpy()
+            
+            # Store in cache
+            for i, idx in enumerate(batch_indices):
+                md5 = md5_hashes[idx]
+                new_embeddings[md5] = embeddings[i]
+        
+        # Batch write to cache
+        cache.put_batch(new_embeddings)
+        
+        # Merge with cached
+        cached.update(new_embeddings)
+    
+    # Build output array in original order
+    result = np.zeros((n_images, embedding_dim), dtype=np.float32)
+    for i, md5 in enumerate(md5_hashes):
+        result[i] = cached[md5]
+    
+    return result
+
+
+def prepare_structure_pairing(
+    dataset: RFPix2pixDataset,
+    structure_candidates: int,
+    max_size: int,
+) -> StructurePairing:
+    """
+    Prepare structure pairing by computing embeddings for both domains.
+    
+    Args:
+        dataset: Dataset with image paths for both domains
+        structure_candidates: Number of similar images to consider for pairing
+        max_size: Image size for embedding computation
+        
+    Returns:
+        StructurePairing object ready for use in dataset
+    """
+    print(f"\n{C.BOLD}{C.MAGENTA}━━━ Computing Structure Embeddings ━━━{C.RESET}")
+    
+    # Initialize encoder and cache
+    print(f"{C.DIM}  Loading DINOv2 encoder...{C.RESET}")
+    encoder = StructureEncoder().to(device)
+    cache = EmbeddingCache()
+    print(f"{C.DIM}  Cache: {cache}{C.RESET}")
+    
+    # Compute embeddings for both domains
+    print(f"\n{C.BRIGHT_CYAN}  Domain 0:{C.RESET} {len(dataset.domain_0_image_paths)} images")
+    embeddings_0 = compute_structure_embeddings(
+        dataset.domain_0_image_paths,
+        encoder,
+        cache,
+        max_size,
+        desc="Domain 0",
+    )
+    
+    print(f"\n{C.BRIGHT_CYAN}  Domain 1:{C.RESET} {len(dataset.domain_1_image_paths)} images")
+    embeddings_1 = compute_structure_embeddings(
+        dataset.domain_1_image_paths,
+        encoder,
+        cache,
+        max_size,
+        desc="Domain 1",
+    )
+    
+    # Create pairing object
+    pairing = StructurePairing(
+        embeddings_0=embeddings_0,
+        embeddings_1=embeddings_1,
+        structure_candidates=structure_candidates,
+    )
+    
+    print(f"\n{C.GREEN}✓ Structure pairing ready{C.RESET} (top-{structure_candidates} candidates per image)\n")
+    
+    # Clean up encoder from GPU
+    del encoder
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return pairing
 
 
 def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, dev: bool) -> float:
@@ -532,5 +691,21 @@ if __name__ == "__main__":
     if args.saliency_only:
         print(f"{C.GREEN}✓ Saliency-only mode: skipping velocity training.{C.RESET}")
     else:
+        # Phase 1.5: Prepare structure pairing if enabled
+        if model.structure_pairing:
+            structure_pairing = prepare_structure_pairing(
+                dataset,
+                structure_candidates=model.structure_candidates,
+                max_size=model.max_size,
+            )
+            # Recreate dataset with structure pairing
+            dataset = RFPix2pixDataset(
+                domain_0_paths=args.domain0,
+                domain_1_paths=args.domain1,
+                max_size=model.max_size,
+                num_downsamples=model.velocity_net.num_downsamples,
+                structure_pairing=structure_pairing,
+            )
+        
         # Phase 2: Train velocity network
         train_velocity(model, dataset, run_dir, step_start=step_start, dev=args.dev)

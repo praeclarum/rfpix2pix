@@ -1,4 +1,4 @@
-from typing import List, Callable
+from typing import List, Callable, Optional, Tuple
 import glob
 import random
 import numpy as np
@@ -16,19 +16,103 @@ def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg
     paths.sort()
     return paths
 
+
+class StructurePairing:
+    """
+    Structure-aware pairing for velocity training.
+    
+    Given precomputed structure embeddings for both domains, finds
+    structurally similar images across domains using cosine similarity.
+    Enables better velocity training by pairing images with similar
+    composition, pose, and layout.
+    """
+    
+    def __init__(
+        self,
+        embeddings_0: np.ndarray,
+        embeddings_1: np.ndarray,
+        structure_candidates: int = 8,
+    ):
+        """
+        Initialize structure pairing.
+        
+        Args:
+            embeddings_0: (N, D) normalized embeddings for domain 0 images
+            embeddings_1: (M, D) normalized embeddings for domain 1 images
+            structure_candidates: Number of top similar images to consider
+        """
+        self.embeddings_0 = embeddings_0  # (N, D)
+        self.embeddings_1 = embeddings_1  # (M, D)
+        self.structure_candidates = structure_candidates
+        
+        # Precompute similarity matrix: (N, M) = embeddings_0 @ embeddings_1.T
+        # Since embeddings are L2-normalized, dot product = cosine similarity
+        self.similarity_matrix = embeddings_0 @ embeddings_1.T  # (N, M)
+        
+        # Precompute top-K indices for each domain 0 image
+        # This avoids repeated argsort during training
+        k = min(structure_candidates, self.similarity_matrix.shape[1])
+        # argsort in descending order, take top k
+        self.top_k_indices = np.argsort(-self.similarity_matrix, axis=1)[:, :k]  # (N, k)
+    
+    def get_paired_index(self, domain_0_idx: int) -> int:
+        """
+        Get a structurally similar domain 1 index for a domain 0 image.
+        
+        Randomly samples from top-K most similar domain 1 images.
+        
+        Args:
+            domain_0_idx: Index of the domain 0 image
+            
+        Returns:
+            Index of a structurally similar domain 1 image
+        """
+        candidates = self.top_k_indices[domain_0_idx]
+        return int(random.choice(candidates))
+
+
 class RFPix2pixDataset(Dataset):
-    def __init__(self, domain_0_paths: list[str], domain_1_paths: list[str], max_size: int, num_downsamples: int):
+    def __init__(
+        self,
+        domain_0_paths: list[str],
+        domain_1_paths: list[str],
+        max_size: int,
+        num_downsamples: int,
+        structure_pairing: Optional[StructurePairing] = None,
+    ):
         self.domain_0_image_paths = get_image_paths(domain_0_paths)
         self.domain_1_image_paths = get_image_paths(domain_1_paths)
         self.max_image_size = max_size
         self.image_size_multiple = 2 ** num_downsamples
+        self.structure_pairing = structure_pairing
+        
+        # Validate structure pairing dimensions match
+        if structure_pairing is not None:
+            n0 = len(self.domain_0_image_paths)
+            n1 = len(self.domain_1_image_paths)
+            e0 = structure_pairing.embeddings_0.shape[0]
+            e1 = structure_pairing.embeddings_1.shape[0]
+            if e0 != n0 or e1 != n1:
+                raise ValueError(
+                    f"Structure pairing dimension mismatch: "
+                    f"embeddings ({e0}, {e1}) != paths ({n0}, {n1})"
+                )
 
     def __len__(self):
         return max(len(self.domain_0_image_paths), len(self.domain_1_image_paths))
 
     def __getitem__(self, index):
-        domain_0_path = self.domain_0_image_paths[random.randint(0, len(self.domain_0_image_paths) - 1)]
-        domain_1_path = self.domain_1_image_paths[random.randint(0, len(self.domain_1_image_paths) - 1)]
+        # Sample domain 0 image (random)
+        domain_0_idx = random.randint(0, len(self.domain_0_image_paths) - 1)
+        domain_0_path = self.domain_0_image_paths[domain_0_idx]
+        
+        # Sample domain 1 image (structure-paired or random)
+        if self.structure_pairing is not None:
+            domain_1_idx = self.structure_pairing.get_paired_index(domain_0_idx)
+        else:
+            domain_1_idx = random.randint(0, len(self.domain_1_image_paths) - 1)
+        domain_1_path = self.domain_1_image_paths[domain_1_idx]
+        
         domain_0_image = self.load_and_preprocess_image(domain_0_path)
         domain_1_image = self.load_and_preprocess_image(domain_1_path)
         return {'domain_0': domain_0_image, 'domain_1': domain_1_image}

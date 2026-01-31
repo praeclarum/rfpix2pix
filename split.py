@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 from fnn import device, load_module
 from model import RFPix2pixModel
-from utils import Colors as C
+from utils import Colors as C, compute_file_md5
 
 
 def parse_args():
@@ -164,15 +164,6 @@ def get_existing_hashes(output_dir: Path) -> Set[str]:
                         hashes.add(hash_part.lower())
     
     return hashes
-
-
-def compute_file_md5(file_path: str) -> str:
-    """Compute MD5 hash of a file's contents."""
-    hasher = hashlib.md5()
-    with open(file_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
-            hasher.update(chunk)
-    return hasher.hexdigest().lower()
 
 
 def load_image_for_inference(path: str, max_size: int) -> torch.Tensor:

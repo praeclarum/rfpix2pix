@@ -68,3 +68,9 @@ Once the saliency network is trained, it is frozen and the velocity network is t
 `loss = ||J_h(x_t) @ (v_target - v_pred)||²`
 
 where `J_h` is the Jacobian of the saliency network's `get_latent()` function, computed via JVP (Jacobian-vector product).
+
+**Structure-Aware Pairing** (optional): Set `structure_pairing: true` to enable intelligent image pairing during velocity training. Instead of random cross-domain pairing, this uses DINOv2 embeddings to find structurally similar images across domains. This helps when domains have diverse compositions (close-ups vs wide shots, different scenes) by matching images with similar layout/pose.
+
+- Embeddings are cached globally in `~/.cache/rfpix2pix/dino_embeddings.db` (SQLite)
+- `structure_candidates` controls how many similar images to consider (default: 8)
+- Higher values = more variety, lower values = stricter matching
