@@ -196,6 +196,10 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             input_domain_0 = inputs["domain_0"].to(device)  # (B, 3, H, W)
             input_domain_1 = inputs["domain_1"].to(device)  # (B, 3, H, W)
             
+            # Apply saliency-specific augmentations (if configured)
+            input_domain_0 = rf_model.saliency_augment(input_domain_0)
+            input_domain_1 = rf_model.saliency_augment(input_domain_1)
+            
             output = rf_model.compute_saliency_loss(input_domain_0, input_domain_1)
             loss = output['loss']
             grad_loss: torch.Tensor = loss * grad_scale

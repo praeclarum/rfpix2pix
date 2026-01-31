@@ -39,6 +39,14 @@ The saliency network `h(x)` is a domain classifier (e.g., ResNet-based) that lea
 
 **Blend Training** (optional): Set `saliency_blend_fraction` (0.0 to 1.0) to expose the classifier to interpolated images `x_t = t*x1 + (1-t)*x0` during training. This uses soft cross-entropy with targets `[1-t, t]`, which degenerates to hard labels at t=0 or t=1. The goal is to improve Jacobian quality at intermediate timesteps during velocity training.
 
+**Label Smoothing** (optional): Set `saliency_label_smoothing` (0.0 to 1.0, typically 0.1) to prevent classifier overconfidence. Soft targets are smoothed: `targets = targets * (1 - ε) + ε / num_classes`.
+
+**Data Augmentation** (optional): Set `saliency_augmentations` to a list of augmentation names to improve classifier robustness. Supported augmentations:
+- `"color_jitter"`: Random brightness/contrast/saturation/hue. Prevents color histogram shortcuts.
+- `"grayscale"`: Random grayscale conversion (p=0.1). Forces learning texture/shape.
+- `"random_erasing"`: Random rectangular patch erasure. Prevents relying on single regions.
+- `"gaussian_blur"`: Random Gaussian blur. Forces learning coarser structure.
+
 This phase has two sub-phases for pretrained backbones:
 
 1. **Backbone Warmup** (frozen backbone): Train only the head layers (`latent_proj`, `classifier`) until accuracy reaches `saliency_warmup_threshold`. This prevents random gradients from corrupting pretrained weights.

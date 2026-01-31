@@ -11,6 +11,8 @@
     "saliency_accuracy_threshold": 0.9998,
     "saliency_warmup_threshold": 0.95,
     "saliency_blend_fraction": 0.5,
+    "saliency_label_smoothing": 0.0,
+    "saliency_augmentations": [],
     "velocity_net": {
         "type": "UNet",
         "model_channels": 64,

@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, List
 
 import torch
 
 from fnn import *
+from data import SaliencyAugmentation
 
 
 class RFPix2pixModel(nn.Module):
@@ -22,6 +23,8 @@ class RFPix2pixModel(nn.Module):
         saliency_accuracy_threshold: float,
         saliency_warmup_threshold: float,
         saliency_blend_fraction: float = 0.0,
+        saliency_label_smoothing: float = 0.0,
+        saliency_augmentations: List[str] = [],
     ):
         super().__init__()
         self.max_size = max_size
@@ -35,6 +38,9 @@ class RFPix2pixModel(nn.Module):
         self.saliency_accuracy_threshold = saliency_accuracy_threshold
         self.saliency_warmup_threshold = saliency_warmup_threshold
         self.saliency_blend_fraction = saliency_blend_fraction
+        self.saliency_label_smoothing = saliency_label_smoothing
+        self.saliency_augmentations = saliency_augmentations
+        self.saliency_augment = SaliencyAugmentation(saliency_augmentations)
         self.velocity_net = object_from_config(
             velocity_net,
             input_channels=3,
@@ -152,6 +158,13 @@ class RFPix2pixModel(nn.Module):
         # Soft targets: [1-t, t] for each sample
         # At t=0: [1, 0] = domain 0, at t=1: [0, 1] = domain 1
         soft_targets = torch.stack([1 - t, t], dim=1)  # (2B, 2)
+        
+        # Apply label smoothing: targets = targets * (1 - ε) + ε / num_classes
+        # This prevents overconfidence and keeps gradients flowing
+        if self.saliency_label_smoothing > 0:
+            num_classes = soft_targets.shape[1]
+            smooth_targets = soft_targets * (1 - self.saliency_label_smoothing)
+            soft_targets = smooth_targets + self.saliency_label_smoothing / num_classes
         
         # Soft cross-entropy loss: -sum(targets * log_softmax(logits), dim=1)
         # This generalizes standard CE: at t=0 or t=1, it equals hard CE

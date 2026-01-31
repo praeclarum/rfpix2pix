@@ -3,7 +3,9 @@ import glob
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset
+import torchvision.transforms.v2 as T
 from PIL import Image
 
 def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg', 'jpeg']) -> List[str]:
@@ -52,3 +54,93 @@ class RFPix2pixDataset(Dataset):
         if should_hflip:
             image_tensor = torch.flip(image_tensor, dims=[2])
         return image_tensor
+
+class SaliencyAugmentation(nn.Module):
+    """
+    Data augmentation for saliency network training.
+    
+    Wraps torchvision transforms to work with [-1, 1] colorspace.
+    Converts to [0, 1] before transforms, then back to [-1, 1] after.
+    
+    Supported augmentations:
+        - "color_jitter": Random brightness/contrast/saturation/hue
+        - "grayscale": Random grayscale conversion (p=0.1)
+        - "random_erasing": Random rectangular patch erasure
+        - "gaussian_blur": Random Gaussian blur
+    """
+    
+    def __init__(self, augmentations: List[str]):
+        """
+        Initialize augmentation pipeline.
+        
+        Args:
+            augmentations: List of augmentation names to apply.
+                          Empty list = no augmentation (identity).
+        """
+        super().__init__()
+        self.augmentations = augmentations
+        
+        if not augmentations:
+            self.transform = None
+            return
+        
+        transforms = []
+        for aug in augmentations:
+            if aug == "color_jitter":
+                # Random brightness/contrast/saturation/hue
+                # Forces learning texture/shape over color shortcuts
+                transforms.append(T.ColorJitter(
+                    brightness=0.3,
+                    contrast=0.3,
+                    saturation=0.3,
+                    hue=0.1,
+                ))
+            elif aug == "grayscale":
+                # Random grayscale with low probability
+                # Useful if color isn't the primary style difference
+                transforms.append(T.RandomGrayscale(p=0.1))
+            elif aug == "random_erasing":
+                # Random rectangular patch erasure
+                # Prevents relying on single discriminative regions
+                # Note: operates on [0,1] range, erases with random values
+                transforms.append(T.RandomErasing(
+                    p=0.2,
+                    scale=(0.02, 0.2),
+                    ratio=(0.3, 3.3),
+                ))
+            elif aug == "gaussian_blur":
+                # Random Gaussian blur
+                # Forces learning coarser structure
+                transforms.append(T.GaussianBlur(
+                    kernel_size=5,
+                    sigma=(0.1, 2.0),
+                ))
+            else:
+                raise ValueError(f"Unknown saliency augmentation: {aug}")
+        
+        self.transform = T.Compose(transforms)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply augmentations to input tensor.
+        
+        Args:
+            x: (B, 3, H, W) images in [-1, 1] range
+            
+        Returns:
+            (B, 3, H, W) augmented images in [-1, 1] range
+        """
+        if self.transform is None:
+            return x
+        
+        # Convert [-1, 1] -> [0, 1] for torchvision transforms
+        x_01 = (x + 1.0) / 2.0
+        
+        # Apply transforms
+        x_aug = self.transform(x_01)
+        
+        # Convert [0, 1] -> [-1, 1]
+        x_out = x_aug * 2.0 - 1.0
+        
+        return x_out
+
