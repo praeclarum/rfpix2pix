@@ -498,7 +498,6 @@ def compute_structure_embeddings(
     encoder: StructureEncoder,
     cache: EmbeddingCache,
     device: torch.device,
-    batch_size: int = 16,
     desc: str = "Computing embeddings",
 ) -> np.ndarray:
     """
@@ -514,7 +513,6 @@ def compute_structure_embeddings(
         image_paths: List of image file paths
         encoder: StructureEncoder (DINOv2) model
         cache: EmbeddingCache for persistent storage
-        batch_size: Batch size for encoding
         desc: Description for progress bar
         
     Returns:
@@ -547,48 +545,41 @@ def compute_structure_embeddings(
     if needs_compute:
         new_embeddings = {}
         
-        # Process in batches
-        for batch_start in tqdm(range(0, len(needs_compute), batch_size), desc=desc):
-            batch_indices = needs_compute[batch_start:batch_start + batch_size]
+        # Process one image at a time (images have different aspect ratios)
+        for idx in tqdm(needs_compute, desc=desc):
+            path = image_paths[idx]
+            img = Image.open(path).convert("RGB")
             
-            # Load and preprocess images
-            batch_tensors = []
-            for idx in batch_indices:
-                path = image_paths[idx]
-                img = Image.open(path).convert("RGB")
-                
-                # Resize preserving aspect ratio (short side = DINO_TARGET_SIZE)
-                w, h = img.size
-                if w < h:
-                    new_w = DINO_TARGET_SIZE
-                    new_h = int(h * DINO_TARGET_SIZE / w)
-                else:
-                    new_h = DINO_TARGET_SIZE
-                    new_w = int(w * DINO_TARGET_SIZE / h)
-                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                
-                # Minimally crop to make dimensions multiples of DINO_PATCH_SIZE
-                w, h = img.size
-                crop_w = (w // DINO_PATCH_SIZE) * DINO_PATCH_SIZE
-                crop_h = (h // DINO_PATCH_SIZE) * DINO_PATCH_SIZE
-                left = (w - crop_w) // 2
-                top = (h - crop_h) // 2
-                img = img.crop((left, top, left + crop_w, top + crop_h))
-                # Convert to tensor in [-1, 1]
-                arr = np.array(img).astype(np.float32) / 127.5 - 1.0
-                arr = np.transpose(arr, (2, 0, 1))
-                batch_tensors.append(torch.from_numpy(arr))
+            # Resize preserving aspect ratio (short side = DINO_TARGET_SIZE)
+            w, h = img.size
+            if w < h:
+                new_w = DINO_TARGET_SIZE
+                new_h = int(h * DINO_TARGET_SIZE / w)
+            else:
+                new_h = DINO_TARGET_SIZE
+                new_w = int(w * DINO_TARGET_SIZE / h)
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
             
-            batch = torch.stack(batch_tensors).to(device)
+            # Minimally crop to make dimensions multiples of DINO_PATCH_SIZE
+            w, h = img.size
+            crop_w = (w // DINO_PATCH_SIZE) * DINO_PATCH_SIZE
+            crop_h = (h // DINO_PATCH_SIZE) * DINO_PATCH_SIZE
+            left = (w - crop_w) // 2
+            top = (h - crop_h) // 2
+            img = img.crop((left, top, left + crop_w, top + crop_h))
+            
+            # Convert to tensor in [-1, 1]
+            arr = np.array(img).astype(np.float32) / 127.5 - 1.0
+            arr = np.transpose(arr, (2, 0, 1))
+            tensor = torch.from_numpy(arr).unsqueeze(0).to(device)
             
             # Encode
             with torch.no_grad():
-                embeddings = encoder(batch).cpu().numpy()
+                embedding = encoder(tensor).cpu().numpy()[0]
             
             # Store in cache
-            for i, idx in enumerate(batch_indices):
-                md5 = md5_hashes[idx]
-                new_embeddings[md5] = embeddings[i]
+            md5 = md5_hashes[idx]
+            new_embeddings[md5] = embedding
         
         # Batch write to cache
         cache.put_batch(new_embeddings)
