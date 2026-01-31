@@ -456,6 +456,8 @@ if __name__ == "__main__":
     # Generate run ID
     date_id = datetime.datetime.now().strftime("%Y%m%d%H%M")
     run_id = f"run_{date_id}"
+    if args.dev:
+        run_id += "_dev"
     run_dir = os.path.join("runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
     print(f"{C.BLUE}▶ Run directory:{C.RESET} {C.BOLD}{run_dir}{C.RESET}\n")
@@ -473,6 +475,13 @@ if __name__ == "__main__":
             os.path.join(prev_run_dir, SALIENCY_STATE_FILE),
             os.path.join(run_dir, SALIENCY_STATE_FILE)
         )
+        try:
+            data_paths = json.load(open(os.path.join(prev_run_dir, "data.json"), "r"))
+            args.domain0 = data_paths["domain0_paths"]
+            args.domain1 = data_paths["domain1_paths"]
+        except Exception as e:
+            print(f"{C.RED}▶ Warning: Failed to restore data paths from previous run: {e}{C.RESET}")
+        print(f"{C.BLUE}▶ Resuming from step {C.CYAN}{step_start}{C.RESET}\n")
     else:
         print(f"{C.BLUE}▶ Creating new model{C.RESET}")
         model: RFPix2pixModel = object_from_config(config).to(device)
@@ -492,6 +501,16 @@ if __name__ == "__main__":
     config_save_path = os.path.join(run_dir, "config.json")
     with open(config_save_path, "w") as f:
         json.dump(config, f, indent=2)
+    print(f"{C.BLUE}▶ Saved config to {C.BOLD}{config_save_path}{C.RESET}\n")
+
+    # Save data paths to run directory
+    data_save_path = os.path.join(run_dir, "data.json")
+    with open(data_save_path, "w") as f:
+        json.dump({
+            "domain0_paths": args.domain0,
+            "domain1_paths": args.domain1,
+        }, f, indent=2)
+    print(f"{C.BLUE}▶ Saved data to {C.BOLD}{data_save_path}{C.RESET}\n")
 
     # Sample to make sure everything is working
     sample(model, dataset, run_dir, f"init_{step_start}")
