@@ -749,6 +749,17 @@ if __name__ == "__main__":
     # Sample to make sure everything is working
     sample(model, dataset, run_dir, f"init_{step_start}")
     
+    # Phase 0: Prepare structure pairing if enabled
+    structure_pairing: Optional[StructurePairing] = None
+    if model.structure_pairing:
+        structure_pairing = prepare_structure_pairing(
+            dataset,
+            structure_candidates=model.structure_candidates,
+            max_size=model.max_size,
+        )
+        # Generate proof sheet for debugging structure pairings
+        sample_structure_pairings(dataset, structure_pairing, run_dir)
+
     # Phase 1: Train saliency network if needed
     if should_train_saliency(run_dir, model.saliency_accuracy_threshold):
         final_accuracy = train_saliency(model, dataset, run_dir, dev=args.dev)
@@ -757,15 +768,7 @@ if __name__ == "__main__":
     if args.saliency_only:
         print(f"{C.GREEN}✓ Saliency-only mode: skipping velocity training.{C.RESET}")
     else:
-        # Phase 1.5: Prepare structure pairing if enabled
-        if model.structure_pairing:
-            structure_pairing = prepare_structure_pairing(
-                dataset,
-                structure_candidates=model.structure_candidates,
-                max_size=model.max_size,
-            )
-            # Generate proof sheet for debugging structure pairings
-            sample_structure_pairings(dataset, structure_pairing, run_dir)
+        if structure_pairing is not None:
             # Recreate dataset with structure pairing
             dataset = RFPix2pixDataset(
                 domain_0_paths=args.domain0,
