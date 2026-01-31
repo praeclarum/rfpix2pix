@@ -424,6 +424,72 @@ def sample(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, na
     print(f"Saved sample grid to {path} ({image.width}x{image.height})")
 
 
+@torch.no_grad()
+def sample_structure_pairings(
+    dataset: RFPix2pixDataset,
+    pairing: StructurePairing,
+    run_dir: str,
+    num_samples: int = 16,
+):
+    """
+    Generate a proof sheet showing structure pairings for debugging.
+    
+    Creates a grid where each row shows:
+    - Column 0: A domain 0 image
+    - Columns 1..K: Top-K most similar domain 1 images (sorted by similarity)
+    
+    Args:
+        dataset: Dataset with image paths for both domains
+        pairing: StructurePairing object with precomputed similarities
+        run_dir: Directory to save the proof sheet
+        num_samples: Number of domain 0 images to sample (rows in grid)
+    """
+    print(f"\n{C.BOLD}{C.MAGENTA}━━━ Structure Pairing Proof Sheet ━━━{C.RESET}")
+    
+    n_domain_0 = len(dataset.domain_0_image_paths)
+    k = pairing.top_k_indices.shape[1]  # Number of candidates per image
+    
+    # Sample random domain 0 indices
+    if num_samples >= n_domain_0:
+        domain_0_indices = list(range(n_domain_0))
+    else:
+        domain_0_indices = random.sample(range(n_domain_0), num_samples)
+    
+    rows = []
+    for d0_idx in tqdm(domain_0_indices, desc="Building proof sheet"):
+        # Load domain 0 image
+        d0_path = dataset.domain_0_image_paths[d0_idx]
+        d0_image = dataset.load_and_preprocess_image(d0_path)  # (3, H, W)
+        
+        # Get top-K domain 1 candidates (already sorted by similarity)
+        d1_indices = pairing.top_k_indices[d0_idx]  # (K,)
+        
+        # Build row: [domain_0, match_1, match_2, ..., match_K]
+        row_images = [d0_image]
+        for d1_idx in d1_indices:
+            d1_path = dataset.domain_1_image_paths[d1_idx]
+            d1_image = dataset.load_and_preprocess_image(d1_path)  # (3, H, W)
+            row_images.append(d1_image)
+        
+        # Concatenate horizontally: (3, H, W*(K+1))
+        row = torch.cat([img.unsqueeze(0) for img in row_images], dim=3)  # (1, 3, H, W*(K+1))
+        rows.append(row)
+    
+    # Stack all rows vertically: (1, 3, H*num_samples, W*(K+1))
+    grid = torch.cat(rows, dim=2)
+    
+    # Convert from [-1, 1] to [0, 255]
+    grid = (grid.squeeze(0).cpu().numpy() + 1.0) * 127.5
+    grid = grid.clip(0, 255).astype("uint8")
+    grid = Image.fromarray(grid.transpose(1, 2, 0))
+    
+    # Save the proof sheet
+    path = os.path.join(run_dir, "structure_pairings.jpg")
+    grid.save(path, quality=90)
+    print(f"{C.GREEN}✓ Saved structure pairing proof sheet to {C.BOLD}{path}{C.RESET}")
+    print(f"  {C.DIM}Grid: {len(domain_0_indices)} rows × {k + 1} columns (source + {k} matches){C.RESET}\n")
+
+
 def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, step_start: int, dev: bool):
     """
     Train the velocity network using saliency-weighted flow matching loss.
@@ -493,8 +559,8 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}\n")
 
-    sample_steps = 32
-    max_sample_steps = 256
+    sample_steps = 64
+    max_sample_steps = 512
     next_sample_step = step_start + sample_steps
 
     save_steps = 1024
@@ -698,6 +764,8 @@ if __name__ == "__main__":
                 structure_candidates=model.structure_candidates,
                 max_size=model.max_size,
             )
+            # Generate proof sheet for debugging structure pairings
+            sample_structure_pairings(dataset, structure_pairing, run_dir)
             # Recreate dataset with structure pairing
             dataset = RFPix2pixDataset(
                 domain_0_paths=args.domain0,
