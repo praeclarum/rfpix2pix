@@ -5,6 +5,7 @@ import argparse
 import os
 import json
 import datetime
+import shutil
 
 import torch
 from tqdm import tqdm
@@ -455,8 +456,9 @@ if __name__ == "__main__":
     # Generate run ID
     date_id = datetime.datetime.now().strftime("%Y%m%d%H%M")
     run_id = f"run_{date_id}"
-    if args.dev:
-        run_id += "_dev"
+    run_dir = os.path.join("runs", run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"{C.BLUE}▶ Run directory:{C.RESET} {C.BOLD}{run_dir}{C.RESET}\n")
     
     # Load or create model
     step_start = 0
@@ -466,16 +468,14 @@ if __name__ == "__main__":
         print(f"{C.BLUE}▶ Loading model from {C.BOLD}{args.checkpoint}{C.RESET}")
         model: RFPix2pixModel = load_module(args.checkpoint).to(device)  # type: ignore
         config = model.__config
-        run_dir = os.path.dirname(args.checkpoint)
-        run_id = os.path.basename(run_dir)
+        prev_run_dir = os.path.dirname(args.checkpoint)
+        shutil.copy(
+            os.path.join(prev_run_dir, SALIENCY_STATE_FILE),
+            os.path.join(run_dir, SALIENCY_STATE_FILE)
+        )
     else:
         print(f"{C.BLUE}▶ Creating new model{C.RESET}")
         model: RFPix2pixModel = object_from_config(config).to(device)
-        run_dir = os.path.join("runs", run_id)
-        os.makedirs(run_dir, exist_ok=True)
-        config_save_path = os.path.join(run_dir, "config.json")
-        with open(config_save_path, "w") as f:
-            json.dump(config, f, indent=2)
     
     model.compile()
     
@@ -488,8 +488,10 @@ if __name__ == "__main__":
     )
     print(f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} domain 0 images, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
     
-    # Create run directory
-    print(f"{C.BLUE}▶ Run directory:{C.RESET} {C.BOLD}{run_dir}{C.RESET}\n")
+    # Save config to run directory
+    config_save_path = os.path.join(run_dir, "config.json")
+    with open(config_save_path, "w") as f:
+        json.dump(config, f, indent=2)
 
     # Sample to make sure everything is working
     sample(model, dataset, run_dir, f"init_{step_start}")
