@@ -141,10 +141,6 @@ class RFPix2pixDataset(Dataset):
         image_array = np.array(image).astype(np.float32) / 127.5 - 1.0
         image_array = np.transpose(image_array, (2, 0, 1))
         image_tensor = torch.from_numpy(image_array)
-        # Random horizontal flip
-        should_hflip = random.random() < 0.5
-        if should_hflip:
-            image_tensor = torch.flip(image_tensor, dims=[2])
         return image_tensor
 
 class SaliencyAugmentation(nn.Module):
@@ -207,6 +203,9 @@ class SaliencyAugmentation(nn.Module):
                     kernel_size=5,
                     sigma=(0.1, 2.0),
                 ))
+            elif aug == "hflip":
+                # Random horizontal flip
+                transforms.append(T.RandomHorizontalFlip(p=0.5))
             else:
                 raise ValueError(f"Unknown saliency augmentation: {aug}")
         
