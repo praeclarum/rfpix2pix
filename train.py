@@ -443,6 +443,11 @@ Examples:
         action="store_true",
         help="Development mode (smaller batches, more frequent logging)"
     )
+    parser.add_argument(
+        "--saliency-only",
+        action="store_true",
+        help="Only train the saliency network (Phase 1), skip velocity training"
+    )
     
     return parser.parse_args()
 
@@ -524,5 +529,8 @@ if __name__ == "__main__":
         final_accuracy = train_saliency(model, dataset, run_dir, dev=args.dev)
         write_saliency_state(run_dir, accuracy=final_accuracy)
     
-    # Phase 2: Train velocity network
-    train_velocity(model, dataset, run_dir, step_start=step_start, dev=args.dev)
+    if args.saliency_only:
+        print(f"{C.GREEN}✓ Saliency-only mode: skipping velocity training.{C.RESET}")
+    else:
+        # Phase 2: Train velocity network
+        train_velocity(model, dataset, run_dir, step_start=step_start, dev=args.dev)
