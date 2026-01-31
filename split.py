@@ -35,6 +35,12 @@ Examples:
 
   # With custom threshold and batch size
   python split.py -ckpt runs/run_xxx/model.ckpt -i images1 images2 -o output --threshold 0.8 --batch-size 32
+
+  # Split with max image size of 1024px
+  python split.py -ckpt runs/run_xxx/model.ckpt -i images -o output --max-size 1024
+
+  # Resize existing output images to max 1024px
+  python split.py -ckpt runs/run_xxx/model.ckpt -i . -o output --max-size 1024 --resize-existing
         """
     )
     
@@ -68,6 +74,23 @@ Examples:
         type=int,
         default=16,
         help="Batch size for inference (default: 16)"
+    )
+    parser.add_argument(
+        "--max-size", "-s",
+        type=int,
+        default=None,
+        help="Maximum dimension for output images. Images larger than this will be resized (default: no resizing)"
+    )
+    parser.add_argument(
+        "--resize-existing",
+        action="store_true",
+        help="Resize existing images in output directory to meet --max-size constraint and exit"
+    )
+    parser.add_argument(
+        "--quality", "-q",
+        type=int,
+        default=95,
+        help="JPEG/WebP quality for resized images (default: 95)"
     )
     
     return parser.parse_args()
@@ -166,6 +189,100 @@ def get_existing_hashes(output_dir: Path) -> Set[str]:
     return hashes
 
 
+def resize_image_to_max_size(image: Image.Image, max_size: int) -> Image.Image:
+    """
+    Resize an image so its largest dimension is <= max_size.
+    Maintains aspect ratio using LANCZOS resampling.
+    Returns the original image if already within limits.
+    """
+    w, h = image.size
+    max_dim = max(w, h)
+    
+    if max_dim <= max_size:
+        return image
+    
+    # Calculate new dimensions maintaining aspect ratio
+    scale = max_size / max_dim
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    
+    return image.resize((new_w, new_h), Image.LANCZOS)
+
+
+def save_image_with_format(image: Image.Image, dest_path: Path, quality: int = 95):
+    """
+    Save an image preserving its format with appropriate settings.
+    """
+    ext = dest_path.suffix.lower()
+    
+    if ext in ('.jpg', '.jpeg'):
+        image.save(dest_path, quality=quality, optimize=True)
+    elif ext == '.webp':
+        image.save(dest_path, quality=quality, method=6)
+    elif ext == '.png':
+        image.save(dest_path, optimize=True)
+    else:
+        # For other formats, just save normally
+        image.save(dest_path)
+
+
+def resize_existing(output_dir: Path, max_size: int, quality: int = 95):
+    """
+    Resize existing images in output directory to meet max_size constraint.
+    Deletes corrupt images. Skips images already within limits.
+    """
+    subdirs = ["domain0", "domain1", "uncertain", "ignored"]
+    image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
+    
+    stats = {
+        "resized": 0,
+        "skipped": 0,
+        "deleted_corrupt": 0,
+    }
+    
+    all_images = []
+    for subdir in subdirs:
+        subdir_path = output_dir / subdir
+        if subdir_path.exists():
+            for file_path in subdir_path.iterdir():
+                if file_path.is_file() and file_path.suffix.lower() in image_extensions:
+                    all_images.append(file_path)
+    
+    print(f"{C.BLUE}▶ Found {len(all_images)} images to check{C.RESET}")
+    
+    for file_path in tqdm(all_images, desc="Checking images", unit="img"):
+        try:
+            image = Image.open(file_path)
+            image.load()  # Force load to detect corrupt images
+            image = image.convert("RGB")
+            
+            w, h = image.size
+            max_dim = max(w, h)
+            
+            if max_dim <= max_size:
+                stats["skipped"] += 1
+                continue
+            
+            # Resize needed
+            resized = resize_image_to_max_size(image, max_size)
+            save_image_with_format(resized, file_path, quality)
+            stats["resized"] += 1
+            
+        except Exception as e:
+            tqdm.write(f"{C.RED}✗ Corrupt image deleted: {file_path} ({e}){C.RESET}")
+            file_path.unlink()
+            stats["deleted_corrupt"] += 1
+    
+    print()
+    print(f"{C.GREEN}{'='*50}{C.RESET}")
+    print(f"{C.GREEN}Resize Existing Complete{C.RESET}")
+    print(f"{C.GREEN}{'='*50}{C.RESET}")
+    print(f"  Resized:         {stats['resized']:>6}")
+    print(f"  Already OK:      {stats['skipped']:>6}")
+    print(f"  Deleted corrupt: {stats['deleted_corrupt']:>6}")
+    print(f"{C.GREEN}{'='*50}{C.RESET}")
+
+
 def load_image_for_inference(path: str, max_size: int) -> torch.Tensor:
     """
     Load and preprocess an image for inference.
@@ -226,6 +343,15 @@ def main():
     
     print(f"{C.BLUE}▶ Output directory: {C.BOLD}{output_dir}{C.RESET}")
     
+    # Handle resize-existing mode
+    if args.resize_existing:
+        if args.max_size is None:
+            print(f"{C.RED}✗ --max-size is required with --resize-existing{C.RESET}")
+            return
+        print(f"{C.BLUE}▶ Resizing existing images to max {args.max_size}px{C.RESET}")
+        resize_existing(output_dir, args.max_size, args.quality)
+        return
+    
     # Load model
     print(f"{C.BLUE}▶ Loading checkpoint: {C.BOLD}{args.checkpoint}{C.RESET}")
     model: RFPix2pixModel = load_module(args.checkpoint).to(device)  # type: ignore
@@ -284,7 +410,21 @@ def main():
                 stats["domain1"] += 1
             
             dest_path = dest_dir / new_filename
-            shutil.copy2(path, dest_path)
+            
+            # Save with optional resizing
+            if args.max_size is not None:
+                try:
+                    image = Image.open(path).convert("RGB")
+                    image = resize_image_to_max_size(image, args.max_size)
+                    save_image_with_format(image, dest_path, args.quality)
+                except Exception as e:
+                    tqdm.write(f"{C.RED}✗ Corrupt image skipped: {path} ({e}){C.RESET}")
+                    # Remove from output if it was partially written
+                    if dest_path.exists():
+                        dest_path.unlink()
+                    continue
+            else:
+                shutil.copy2(path, dest_path)
         
         # Clear batch
         batch_paths.clear()
