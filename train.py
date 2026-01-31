@@ -258,8 +258,136 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     return accuracy_tracker.smoothed if accuracy_tracker.is_stable else accuracy_item
 
 
-def train_velocity(model, dataset, run_dir: str, step_start: int, dev: bool):
-    raise NotImplementedError("Training function is not yet implemented.")
+def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, step_start: int, dev: bool):
+    """
+    Train the velocity network using saliency-weighted flow matching loss.
+    
+    The saliency network is frozen and used to compute gradients that weight
+    the velocity loss. This focuses learning on coordinates that matter for
+    style transfer.
+    
+    Args:
+        rf_model: The RFPix2pixModel with trained saliency network
+        dataset: Dataset providing paired domain images
+        run_dir: Directory for saving checkpoints
+        step_start: Step to resume from (0 for fresh start)
+        dev: If True, skip wandb logging
+    """
+    # Ensure saliency is frozen, velocity is trainable
+    rf_model.eval_saliency()
+    rf_model.velocity_net.train()
+    rf_model.to(device)
+
+    velocity_net = rf_model.velocity_net
+
+    num_steps = rf_model.train_images // rf_model.train_batch_size
+    
+    lr = rf_model.learning_rate
+    
+    optimizer = torch.optim.AdamW(
+        velocity_net.parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        weight_decay=1e-4
+    )
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=rf_model.train_minibatch_size,
+        shuffle=True,
+        num_workers=8
+    )
+    data_iter = iter(dataloader)
+
+    # Extract run_id from run_dir for logging
+    run_id = os.path.basename(run_dir)
+
+    if dev:
+        wandb_run: Optional[wandb.wandb_run.Run] = None
+    else:
+        wandb_run: Optional[wandb.wandb_run.Run] = wandb.init(
+            project="rfpix2pix_velocity",
+            save_code=True,
+            id=f"{run_id}_velocity",
+            config=rf_model.__config,  # pyright: ignore[reportArgumentType]
+        )
+        wandb_run.watch(velocity_net)
+
+    def save(step: int):
+        save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
+
+    num_grad_acc_steps = max(1, rf_model.train_batch_size // rf_model.train_minibatch_size)
+    grad_scale = 1.0 / num_grad_acc_steps
+    
+    print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Velocity Network ━━━{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Steps:{C.RESET}          {C.BOLD}{num_steps}{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Starting step:{C.RESET}  {step_start}")
+    print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {rf_model.train_minibatch_size}")
+    print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
+    print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}\n")
+
+    save_steps = 512
+    next_save_step = ((step_start // save_steps) + 1) * save_steps
+
+    # Loss tracking for smoothed display
+    loss_window: list[float] = []
+    loss_window_size = 100
+
+    progress = tqdm(range(step_start, num_steps), initial=step_start, total=num_steps)
+    for step in progress:
+        optimizer.zero_grad()
+        
+        loss_item = 0.0
+        
+        for grad_step in range(num_grad_acc_steps):
+            # Get data batch
+            try:
+                inputs = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                inputs = next(data_iter)
+            
+            input_domain_0 = inputs["domain_0"].to(device)  # (B, 3, H, W)
+            input_domain_1 = inputs["domain_1"].to(device)  # (B, 3, H, W)
+            
+            # Compute saliency-weighted velocity loss
+            output = rf_model.compute_loss(input_domain_0, input_domain_1)
+            loss = output['loss']
+            grad_loss: torch.Tensor = loss * grad_scale
+            grad_loss.backward()
+
+            loss_item += grad_loss.item()
+
+        optimizer.step()
+        gc.collect()
+        
+        # Update loss tracking
+        loss_window.append(loss_item)
+        if len(loss_window) > loss_window_size:
+            loss_window.pop(0)
+        smoothed_loss = sum(loss_window) / len(loss_window)
+
+        progress.set_postfix({
+            "loss": f"{loss_item:.4f}",
+            "loss_smooth": f"{smoothed_loss:.4f}",
+        })
+        
+        if wandb_run is not None:
+            wlog = {
+                "velocity_loss": loss_item,
+                "velocity_loss_smoothed": smoothed_loss,
+                "lr": lr,
+                "step": step,
+            }
+            wandb_run.log(wlog)
+        
+        if step >= next_save_step:
+            save(step)
+            next_save_step = step + save_steps
+
+    # Final save
+    save(num_steps)
+    print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Velocity training complete{C.RESET} at step {C.CYAN}{num_steps}{C.RESET}\n")
 
 
 def parse_args():
