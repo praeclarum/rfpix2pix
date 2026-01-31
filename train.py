@@ -8,6 +8,28 @@ import json
 import datetime
 
 import torch
+
+# Terminal colors
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    
+    # Regular colors
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    
+    # Bright colors
+    BRIGHT_GREEN = "\033[92m"
+    BRIGHT_YELLOW = "\033[93m"
+    BRIGHT_BLUE = "\033[94m"
+    BRIGHT_MAGENTA = "\033[95m"
+    BRIGHT_CYAN = "\033[96m"
+
+C = Colors  # Short alias
 from tqdm import tqdm
 import wandb
 import wandb.wandb_run
@@ -69,11 +91,11 @@ def write_saliency_state(run_dir: str, accuracy: Optional[float] = None, backbon
         else:
             accuracy_pct = int(round(accuracy))
         state["accuracy"] = accuracy_pct
-        print(f"Saved saliency accuracy: {accuracy_pct}%")
+        print(f"{C.DIM}Saved saliency accuracy: {C.CYAN}{accuracy_pct}%{C.RESET}")
     
     if backbone_warmed_up is not None:
         state["backbone_warmed_up"] = backbone_warmed_up
-        print(f"Saved backbone_warmed_up: {backbone_warmed_up}")
+        print(f"{C.DIM}Saved backbone_warmed_up: {C.CYAN}{backbone_warmed_up}{C.RESET}")
     
     # Write updated state
     state_path = os.path.join(run_dir, SALIENCY_STATE_FILE)
@@ -95,12 +117,12 @@ def should_train_saliency(run_dir: str, threshold: int) -> bool:
     state = read_saliency_state(run_dir)
     accuracy = state["accuracy"]
     if accuracy is None:
-        print(f"No saliency checkpoint found, training needed.")
+        print(f"{C.YELLOW}⚠ No saliency checkpoint found, training needed.{C.RESET}")
         return True
     if accuracy < threshold:
-        print(f"Saliency accuracy {accuracy}% < {threshold}% threshold, training needed.")
+        print(f"{C.YELLOW}⚠ Saliency accuracy {accuracy}% < {threshold}% threshold, training needed.{C.RESET}")
         return True
-    print(f"Saliency accuracy {accuracy}% >= {threshold}% threshold, skipping saliency training.")
+    print(f"{C.GREEN}✓ Saliency accuracy {accuracy}% >= {threshold}% threshold, skipping saliency training.{C.RESET}")
     return False
 
 
@@ -172,11 +194,12 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
 
     num_grad_acc_steps = max(1, rf_model.train_batch_size // rf_model.train_minibatch_size)
     grad_scale = 1.0 / num_grad_acc_steps
-    print(f"Training saliency model for {num_steps} steps")
-    print(f"  minibatch size: {rf_model.train_minibatch_size}")
-    print(f"  grad acc steps: {num_grad_acc_steps}")
-    print(f"  learning rate: {lr}")
-    print(f"  backbone frozen: {backbone_frozen}")
+    print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Saliency Network ━━━{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Steps:{C.RESET}          {C.BOLD}{num_steps}{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {rf_model.train_minibatch_size}")
+    print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
+    print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}")
+    print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}\n")
 
     save_steps = 256
     next_save_step = save_steps
@@ -231,14 +254,14 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
 
         int_accuracy = int(round(accuracy_item * 100))
         if backbone_frozen and int_accuracy >= rf_model.saliency_warmup_threshold:
-            print(f"Saliency backbone warmup complete at step {step}, accuracy {int_accuracy}%")
+            print(f"\n{C.BOLD}{C.GREEN}✓ Backbone warmup complete{C.RESET} at step {C.CYAN}{step}{C.RESET}, accuracy {C.BRIGHT_GREEN}{int_accuracy}%{C.RESET}")
             saliency_net.unfreeze_backbone()
             # Create new optimizer with differential learning rates
             optimizer = create_optimizer(backbone_frozen=False)
             backbone_frozen = False
             write_saliency_state(run_dir, accuracy=int_accuracy, backbone_warmed_up=True)
         elif not backbone_frozen and int_accuracy >= rf_model.saliency_accuracy_threshold:
-            print(f"Saliency training complete at step {step}, accuracy {int_accuracy}%")
+            print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Saliency training complete{C.RESET} at step {C.CYAN}{step}{C.RESET}, accuracy {C.BRIGHT_GREEN}{int_accuracy}%{C.RESET}\n")
             return accuracy_item
         
     return accuracy_item
@@ -313,7 +336,7 @@ if __name__ == "__main__":
     args = parse_args()
     
     # Load config
-    print(f"Loading config from {args.config}")
+    print(f"{C.BLUE}▶ Loading config from {C.BOLD}{args.config}{C.RESET}")
     config = json.load(open(args.config, "r"))
     
     # Generate run ID
@@ -330,11 +353,11 @@ if __name__ == "__main__":
     if args.checkpoint:
         # Extract step from checkpoint filename (e.g., model_1000.ckpt -> 1000)
         step_start = int(args.checkpoint.split("_")[-1].split(".")[0])
-        print(f"Loading model from {args.checkpoint}")
+        print(f"{C.BLUE}▶ Loading model from {C.BOLD}{args.checkpoint}{C.RESET}")
         model: RFPix2pixModel = load_module(args.checkpoint).to(device)  # type: ignore
         config = model.__config
     else:
-        print("Creating new model")
+        print(f"{C.BLUE}▶ Creating new model{C.RESET}")
         model: RFPix2pixModel = object_from_config(config).to(device)
     
     model.compile()
@@ -346,12 +369,12 @@ if __name__ == "__main__":
         max_size=model.max_size,
         num_downsamples=model.velocity_net.num_downsamples,
     )
-    print(f"Dataset: {len(dataset.domain_0_image_paths)} domain 0 images, {len(dataset.domain_1_image_paths)} domain 1 images")
+    print(f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} domain 0 images, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
     
     # Create run directory
     run_dir = os.path.join("runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
-    print(f"Run directory: {run_dir}")
+    print(f"{C.BLUE}▶ Run directory:{C.RESET} {C.BOLD}{run_dir}{C.RESET}\n")
     
     # Save config to run directory
     config_save_path = os.path.join(run_dir, "config.json")
