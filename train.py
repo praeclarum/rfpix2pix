@@ -331,7 +331,7 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}")
     print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}\n")
 
-    save_steps = 512
+    save_steps = 1024
     next_save_step = save_steps
 
     accuracy_item = 0.0
@@ -497,7 +497,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     max_sample_steps = 256
     next_sample_step = step_start + sample_steps
 
-    save_steps = 512
+    save_steps = 1024
     next_save_step = step_start + save_steps
 
     progress = tqdm(range(step_start, last_step), initial=step_start, total=last_step - step_start)
