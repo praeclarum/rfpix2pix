@@ -176,7 +176,8 @@ class ProgressiveImageScanner:
             
             subdirs = []
             images = []
-            
+
+            np.random.shuffle(entries) # pyright: ignore[reportArgumentType]
             for entry in entries:
                 if entry.is_dir():
                     subdirs.append(entry)
