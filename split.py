@@ -6,12 +6,14 @@ and organizes them into domain-specific output directories with MD5-based
 deduplication and an ignore list.
 """
 
+from typing import List, Set, Tuple
 import argparse
 import hashlib
 import os
 import shutil
 from pathlib import Path
-from typing import List, Set, Tuple
+import zipfile
+import tempfile
 
 import numpy as np
 import torch
@@ -112,6 +114,7 @@ class ProgressiveImageScanner:
     """
     
     IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
+    ARCHIVE_EXTENSIONS = {'.zip'}
     
     def __init__(self, directories: List[str]):
         """
@@ -132,6 +135,12 @@ class ProgressiveImageScanner:
                 self.dir_queue.append(path)
             else:
                 print(f"{C.YELLOW}⚠ Directory not found: {d}{C.RESET}")
+
+        # Find safe location to unarchive to
+        # Ideally this is rooted in the TEMPDIR or USER_TMP_DIR
+        tmpdir = Path(tempfile.gettempdir()) / "rfpix2pix_split_temp"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        self.temp_extract_dir = tmpdir
     
     def __iter__(self):
         """Iterate over image paths progressively."""
@@ -142,16 +151,28 @@ class ProgressiveImageScanner:
         while self.dir_queue:
             current_dir = self.dir_queue.popleft()
             self.dirs_scanned += 1
-            
-            try:
-                # List directory contents once
-                entries = list(current_dir.iterdir())
-            except PermissionError:
-                print(f"{C.YELLOW}⚠ Permission denied: {current_dir}{C.RESET}")
-                continue
-            except OSError as e:
-                print(f"{C.YELLOW}⚠ Error reading {current_dir}: {e}{C.RESET}")
-                continue
+
+            entries: list[Path] = []
+            if current_dir.suffix.lower() in self.ARCHIVE_EXTENSIONS:
+                try:
+                    with zipfile.ZipFile(current_dir, 'r') as z:
+                        for file_info in z.infolist():
+                            if Path(file_info.filename).suffix.lower() in self.IMAGE_EXTENSIONS:
+                                extracted_path = z.extract(file_info, path=self.temp_extract_dir)
+                                entries.append(Path(extracted_path))
+                except zipfile.BadZipFile:
+                    print(f"{C.YELLOW}⚠ Bad zip file: {current_dir}{C.RESET}")
+                    continue
+            else:
+                try:
+                    # List directory contents once
+                    entries = list(current_dir.iterdir())
+                except PermissionError:
+                    print(f"{C.YELLOW}⚠ Permission denied: {current_dir}{C.RESET}")
+                    continue
+                except OSError as e:
+                    print(f"{C.YELLOW}⚠ Error reading {current_dir}: {e}{C.RESET}")
+                    continue
             
             subdirs = []
             images = []
@@ -161,6 +182,8 @@ class ProgressiveImageScanner:
                     subdirs.append(entry)
                 elif entry.is_file() and entry.suffix.lower() in self.IMAGE_EXTENSIONS:
                     images.append(entry)
+                elif entry.is_file() and entry.suffix.lower() in self.ARCHIVE_EXTENSIONS:
+                    subdirs.append(entry)
             
             # Yield images from this directory first
             for img_path in images:
