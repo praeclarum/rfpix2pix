@@ -29,6 +29,19 @@ It is able to work with unpaired images by using a feature mapping of an image. 
 - Uses a UNet architecture for the velocity field
 - Images are normalized to [-1, 1] colorspace throughout the app
 
+### Generative Mode
+
+The model can operate in two modes:
+
+1. **Image Translation Mode** (default): Converts images from domain 0 to domain 1 using unpaired data.
+   - Example: `--domain0 data/horses --domain1 data/zebras`
+
+2. **Generative Mode**: Generates images from random noise (standard Gaussian) to domain 1.
+   - Use the magic path `"random"` for domain 0: `--domain0 random --domain1 data/faces`
+   - Domain 0 will be sampled from standard normal distribution N(0,1) (unclipped)
+   - This matches standard Rectified Flow generative modeling
+   - Structure pairing is not applicable in this mode
+
 ## Training Procedure
 
 Training happens in two phases:

@@ -19,6 +19,9 @@ from utils import compute_file_md5, Colors as C
 def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg', 'jpeg']) -> List[str]:
     paths = []
     for directory in directories:
+        # Skip magic "random" string for generative mode
+        if directory.lower() == "random":
+            continue
         for ext in extensions:
             paths.extend(glob.glob(f"{directory}/**/*.{ext}", recursive=True))
     paths.sort()
@@ -67,8 +70,16 @@ class RFPix2pixDataset(Dataset):
         self.image_size_multiple = 2 ** num_downsamples
         self.structure_pairing = structure_pairing
         
+        # Detect generative mode (random noise for domain 0)
+        self.use_random_noise_domain0 = len(self.domain_0_image_paths) == 0
+        
+        # Warn if structure pairing is used with random domain 0
+        if self.use_random_noise_domain0 and structure_pairing is not None:
+            print(f"{C.YELLOW}⚠ Structure pairing is enabled but domain 0 is random noise. "
+                  f"Pairing will be ignored.{C.RESET}")
+        
         # Validate structure pairing dimensions match
-        if structure_pairing is not None:
+        if structure_pairing is not None and not self.use_random_noise_domain0:
             n0 = len(self.domain_0_image_paths)
             n1 = len(self.domain_1_image_paths)
             e0 = structure_pairing.embeddings_0.shape[0]
@@ -80,21 +91,29 @@ class RFPix2pixDataset(Dataset):
                 )
 
     def __len__(self):
+        if self.use_random_noise_domain0:
+            return len(self.domain_1_image_paths)
         return max(len(self.domain_0_image_paths), len(self.domain_1_image_paths))
 
     def __getitem__(self, index):
-        # Sample domain 0 image (random)
-        domain_0_idx = random.randint(0, len(self.domain_0_image_paths) - 1)
-        domain_0_path = self.domain_0_image_paths[domain_0_idx]
-        
-        # Sample domain 1 image (structure-paired or random)
-        if self.structure_pairing is not None:
-            domain_1_idx = self.structure_pairing.get_paired_index(domain_0_idx)
-        else:
+        # Sample domain 0 image (random noise in generative mode, otherwise loaded image)
+        if self.use_random_noise_domain0:
+            # Generative mode: use standard normal noise (unclipped)
+            domain_0_image = torch.randn(3, self.max_image_size, self.max_image_size)
             domain_1_idx = random.randint(0, len(self.domain_1_image_paths) - 1)
-        domain_1_path = self.domain_1_image_paths[domain_1_idx]
+        else:
+            # Image translation mode: load images
+            domain_0_idx = random.randint(0, len(self.domain_0_image_paths) - 1)
+            domain_0_path = self.domain_0_image_paths[domain_0_idx]
+            domain_0_image = load_and_preprocess_image(domain_0_path, self.max_image_size)
+            
+            # Sample domain 1 image (structure-paired or random)
+            if self.structure_pairing is not None:
+                domain_1_idx = self.structure_pairing.get_paired_index(domain_0_idx)
+            else:
+                domain_1_idx = random.randint(0, len(self.domain_1_image_paths) - 1)
         
-        domain_0_image = load_and_preprocess_image(domain_0_path, self.max_image_size)
+        domain_1_path = self.domain_1_image_paths[domain_1_idx]
         domain_1_image = load_and_preprocess_image(domain_1_path, self.max_image_size)
         return {'domain_0': domain_0_image, 'domain_1': domain_1_image}
     
