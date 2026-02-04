@@ -379,7 +379,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
         wandb_run: Optional[wandb.wandb_run.Run] = None
     else:
         wandb_run: Optional[wandb.wandb_run.Run] = wandb.init(
-            project="rfpix2pix",
+            project="rfpix2pix_gen" if rf_model.is_generative else "rfpix2pix",
             save_code=True,
             id=run_id,
             config=rf_model.__config,  # pyright: ignore[reportArgumentType]
@@ -569,7 +569,10 @@ if __name__ == "__main__":
         max_size=model.max_size,
         num_downsamples=model.velocity_net.num_downsamples,
     )
-    print(f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} domain 0 images, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
+    if dataset.use_random_noise_domain0:
+        print(f"{C.BLUE}▶ Dataset:{C.RESET} domain 0 = {C.CYAN}random noise{C.RESET}, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
+    else:
+        print(f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} domain 0 images, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
     
     # Save config to run directory
     config_save_path = os.path.join(run_dir, "config.json")
@@ -600,8 +603,13 @@ if __name__ == "__main__":
         # Generate proof sheet for debugging structure pairings
         sample_structure_pairings(dataset, structure_pairing, run_dir)
 
-    # Phase 1: Train saliency network if needed
-    if should_train_saliency(run_dir, model.saliency_accuracy_threshold):
+    # Set generative mode flag on model
+    model.is_generative = dataset.use_random_noise_domain0
+    
+    # Phase 1: Train saliency network if needed (skip in generative mode)
+    if model.is_generative:
+        print(f"{C.CYAN}ℹ Generative mode: skipping saliency network training (simple MSE loss).{C.RESET}")
+    elif should_train_saliency(run_dir, model.saliency_accuracy_threshold):
         final_accuracy = train_saliency(model, dataset, run_dir, dev=args.dev)
         write_saliency_state(run_dir, accuracy=final_accuracy)
     

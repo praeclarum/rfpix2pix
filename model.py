@@ -55,6 +55,8 @@ class RFPix2pixModel(nn.Module):
         self.num_downsamples = self.velocity_net.num_downsamples
         self.saliency_net: SaliencyNet = object_from_config(saliency_net)
         self.saliency_channels = self.saliency_net.output_channels
+        # Generative mode flag (set by dataset during training)
+        self.is_generative = False
         # Start with saliency network frozen (alternating training phases)
         self.eval_saliency()
 
@@ -294,34 +296,41 @@ class RFPix2pixModel(nn.Module):
         # NOTE: v_pred has gradients connected to velocity_net
         v_error = v_target - v_pred  # (B, 3, H, W)
         
-        # Compute saliency-weighted loss: ||J_h(x_t) @ v_error||²
-        # where J_h is the Jacobian of saliency_net
-        #
-        # The JVP computes: J_h @ v_error, giving shape (B, saliency_channels)
-        # 
-        # GRADIENT FLOW:
-        # - x_t is detached: saliency_net params won't receive gradients from x_t
-        # - v_error retains grad_fn: backprop flows through v_error -> v_pred -> velocity_net
-        # - create_graph=True: ensures the JVP op is in the computation graph
-        
-        def saliency_latent_fn(x):
-            # Use get_latent to get the feature representation h(x)
-            # saliency_net should be frozen (requires_grad=False on params)
-            return self.saliency_net.get_latent(x)
-        
-        # Compute JVP: J_h(x_t) @ v_error
-        # x_t.detach() ensures no gradient flows through the "primal" input
-        # v_error is the "tangent" and retains its gradient connection
-        _, jvp_result = jvp(
-            saliency_latent_fn,
-            (x_t.detach(),),  # primal: detached interpolated state
-            (v_error,),       # tangent: velocity error (has gradients!)
-            create_graph=True # keep in computation graph for backprop
-        )
-        # jvp_result: (B, saliency_channels) - velocity error in feature space
-        
-        # Loss: MSE of saliency-weighted velocity error
-        loss = (jvp_result ** 2).mean() # pyright: ignore[reportOperatorIssue]
+        if self.is_generative:
+            # Generative mode: simple MSE loss (no saliency weighting)
+            # This is standard Rectified Flow: min_v E[||v_target - v_pred||²]
+            loss = (v_error ** 2).mean()
+            jvp_result = None
+        else:
+            # Image translation mode: saliency-weighted loss
+            # Compute saliency-weighted loss: ||J_h(x_t) @ v_error||²
+            # where J_h is the Jacobian of saliency_net
+            #
+            # The JVP computes: J_h @ v_error, giving shape (B, saliency_channels)
+            # 
+            # GRADIENT FLOW:
+            # - x_t is detached: saliency_net params won't receive gradients from x_t
+            # - v_error retains grad_fn: backprop flows through v_error -> v_pred -> velocity_net
+            # - create_graph=True: ensures the JVP op is in the computation graph
+            
+            def saliency_latent_fn(x):
+                # Use get_latent to get the feature representation h(x)
+                # saliency_net should be frozen (requires_grad=False on params)
+                return self.saliency_net.get_latent(x)
+            
+            # Compute JVP: J_h(x_t) @ v_error
+            # x_t.detach() ensures no gradient flows through the "primal" input
+            # v_error is the "tangent" and retains its gradient connection
+            _, jvp_result = jvp(
+                saliency_latent_fn,
+                (x_t.detach(),),  # primal: detached interpolated state
+                (v_error,),       # tangent: velocity error (has gradients!)
+                create_graph=True # keep in computation graph for backprop
+            )
+            # jvp_result: (B, saliency_channels) - velocity error in feature space
+            
+            # Loss: MSE of saliency-weighted velocity error
+            loss = (jvp_result ** 2).mean() # pyright: ignore[reportOperatorIssue]
         
         return {
             "loss": loss,
