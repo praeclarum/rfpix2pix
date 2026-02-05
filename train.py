@@ -545,10 +545,12 @@ if __name__ == "__main__":
         model: RFPix2pixModel = load_module(args.checkpoint).to(device)  # type: ignore
         config = model.__config
         prev_run_dir = os.path.dirname(args.checkpoint)
-        shutil.copy(
-            os.path.join(prev_run_dir, SALIENCY_STATE_FILE),
-            os.path.join(run_dir, SALIENCY_STATE_FILE)
-        )
+        prev_saliency_state_path = os.path.join(prev_run_dir, SALIENCY_STATE_FILE)
+        if os.path.exists(prev_saliency_state_path):
+            shutil.copy(
+                os.path.join(prev_run_dir, SALIENCY_STATE_FILE),
+                os.path.join(run_dir, SALIENCY_STATE_FILE)
+            )
         try:
             data_paths = json.load(open(os.path.join(prev_run_dir, "data.json"), "r"))
             args.domain0 = data_paths["domain0_paths"]
