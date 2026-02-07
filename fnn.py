@@ -152,6 +152,78 @@ class ResBlock(nn.Module):
         return out
 register_type("ResBlock", ResBlock)
 
+
+class SelfAttention2d(nn.Module):
+    """
+    Spatial self-attention for 2D feature maps.
+
+    Uses only CoreML/ANE-safe operations:
+    - 1x1 Conv2d for Q/K/V and output projections
+    - reshape + permute for head splitting
+    - torch.bmm for attention matmul
+    - softmax(dim=-1)
+
+    Applies pre-norm (GroupNorm) and a zero-initialized output projection
+    for stable residual learning: output = x + proj(attn(norm(x))).
+    """
+
+    def __init__(self, channels: int, num_heads: int = 8, normalization: str = "GroupNorm32"):
+        super().__init__()
+        assert channels % num_heads == 0, f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5  # Pre-compute for FP16 safety
+
+        self.norm = get_normalization(normalization, channels)
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.out_proj = zero_module(nn.Conv2d(channels, channels, kernel_size=1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) input feature map
+
+        Returns:
+            (B, C, H, W) output with attended features added as residual
+        """
+        B, C, H, W = x.shape
+        N = H * W  # number of spatial tokens
+
+        h = self.norm(x)
+
+        # Project to Q, K, V using 1x1 convolutions: (B, C, H, W)
+        q = self.q_proj(h)
+        k = self.k_proj(h)
+        v = self.v_proj(h)
+
+        # Reshape to (B*heads, N, head_dim) for batched matmul
+        # From (B, C, H, W) -> (B, heads, head_dim, N) -> (B*heads, N, head_dim)
+        q = q.reshape(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).reshape(B * self.num_heads, N, self.head_dim)
+        k = k.reshape(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).reshape(B * self.num_heads, N, self.head_dim)
+        v = v.reshape(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).reshape(B * self.num_heads, N, self.head_dim)
+
+        # Scale Q before matmul for FP16 numerical stability
+        q = q * self.scale
+
+        # Attention: (B*heads, N, N)
+        attn = torch.bmm(q, k.transpose(1, 2))
+        attn = F.softmax(attn, dim=-1)
+
+        # Apply attention to values: (B*heads, N, head_dim)
+        out = torch.bmm(attn, v)
+
+        # Reshape back to (B, C, H, W)
+        # (B*heads, N, head_dim) -> (B, heads, N, head_dim) -> (B, heads, head_dim, N) -> (B, C, H, W)
+        out = out.reshape(B, self.num_heads, N, self.head_dim).permute(0, 1, 3, 2).reshape(B, C, H, W)
+
+        # Zero-initialized output projection + residual
+        out = self.out_proj(out)
+        return x + out
+
+
 #
 # MODEL
 #
@@ -166,11 +238,14 @@ class UNet(nn.Module):
         activation: str,
         num_res_blocks: int,
         zero_res_blocks: bool = False,
+        attention_resolutions: list[int] = [],
+        num_attention_heads: int = 8,
     ):
         super().__init__()
         self.dtype = torch.float32
         self.model_channels = model_channels
         self.num_downsamples = len(ch_mult)
+        self.attention_resolutions = attention_resolutions
 
         # Timestep embedding MLP
         time_embed_dim = model_channels * 4
@@ -196,6 +271,8 @@ class UNet(nn.Module):
             for _ in range(num_res_blocks - 1):
                 blocks.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks))
             return nn.Sequential(*blocks)
+        enc_attn = []
+        dec_attn = []
         for i, ch_m in enumerate(ch_mult):
             out_ch = model_channels * ch_m
             enc_blocks.append(res_block(ch, out_ch))
@@ -208,6 +285,13 @@ class UNet(nn.Module):
             time_proj_dec.append(nn.Linear(time_embed_dim, out_ch))
             should_upsample = i > 0
             up_blocks.append(nn.UpsamplingBilinear2d(scale_factor=2) if should_upsample else nn.Identity())
+            # Self-attention at specified resolution levels
+            if i in attention_resolutions:
+                enc_attn.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
+                dec_attn.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
+            else:
+                enc_attn.append(nn.Identity())
+                dec_attn.append(nn.Identity())
             ch = out_ch
         self.enc_blocks = nn.ModuleList(enc_blocks)
         self.down_blocks = nn.ModuleList(down_blocks)
@@ -215,6 +299,8 @@ class UNet(nn.Module):
         self.up_blocks = nn.ModuleList(up_blocks)
         self.time_proj_enc = nn.ModuleList(time_proj_enc)
         self.time_proj_dec = nn.ModuleList(time_proj_dec)
+        self.enc_attn = nn.ModuleList(enc_attn)
+        self.dec_attn = nn.ModuleList(dec_attn)
         self.output_block = nn.Sequential(
             res_block(model_channels, model_channels),
             get_normalization(normalization, model_channels),
@@ -243,6 +329,7 @@ class UNet(nn.Module):
             # Add time embedding (broadcast over H, W)
             t_proj = self.time_proj_enc[i](t_emb)[:, :, None, None]  # (B, C, 1, 1)
             h = h + t_proj
+            h = self.enc_attn[i](h)
             res_hs.append(h)
             if i < len(self.down_blocks):
                 h = self.down_blocks[i](h)
@@ -260,6 +347,7 @@ class UNet(nn.Module):
             # Add time embedding
             t_proj = self.time_proj_dec[i](t_emb)[:, :, None, None]
             h = h + t_proj
+            h = self.dec_attn[i](h)
             i -= 1
 
         # Final upsample (from first encoder level, if needed)

@@ -22,6 +22,15 @@ It is able to work with unpaired images by using a feature mapping of an image. 
 > and re-weights coordinates so that the loss focuses on penalizing
 > the error that causes significant changes on `h`.
 
+## Environment
+
+- Do **not** create virtual environments.
+- Ask before installing any new dependencies.
+- Python is version 3.10.12.
+- You must use the command `python3` to run the code, not `python`.
+- All dependencies should be installed globally using `pip3`.
+- PyTorch version is 2.6.0+cu124
+
 ## Implementation Details
 
 - Uses PyTorch for all training
