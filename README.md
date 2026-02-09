@@ -64,11 +64,18 @@ python train.py --config configs/small.json \
 | Argument | Description |
 |----------|-------------|
 | `--config`, `-c` | Path to model config JSON file (required) |
-| `--domain0`, `-d0` | Path(s) to domain 0 image directories (required) |
-| `--domain1`, `-d1` | Path(s) to domain 1 image directories (required) |
+| `--domain0`, `-d0` | Path(s) to domain 0 media directories (images and/or videos) |
+| `--domain1`, `-d1` | Path(s) to domain 1 media directories (images and/or videos) |
 | `--checkpoint`, `-ckpt` | Path to checkpoint file to resume training |
 | `--run-id` | Custom run ID for output directory |
 | `--dev` | Enable development mode |
+
+### Video Sources
+
+- Domain directories can mix still images (`.png`, `.jpg`, `.jpeg`) and video clips (`.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`, `.m4v`).
+- The dataloader seeks to a random timestamp for every sample so videos contribute diverse frames while sharing the exact same preprocessing pipeline (crop, resize, normalization) as images.
+- Structure pairing computes DINO embeddings from a deterministic mid-frame so cached similarities remain stable across runs.
+- Video decoding relies on `torchvision.io.VideoReader`, so ensure your TorchVision build includes FFmpeg support (the default pip wheels do). No extra dependencies are required beyond `torch`, `torchvision`, `pillow`, and `numpy`.
 
 ## Project Structure
 
@@ -76,7 +83,7 @@ python train.py --config configs/small.json \
 rfpix2pix/
 ├── train.py          # Training script and CLI
 ├── model.py          # RFPix2pixModel with saliency and velocity networks
-├── data.py           # Dataset for loading unpaired image domains
+├── data.py           # Dataset for loading unpaired image/video domains
 ├── fnn.py            # Neural network utilities and config system
 └── configs/
     └── small.json    # Example configuration for small model

@@ -3,11 +3,13 @@ import os
 import gc
 import glob
 import random
+from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 import torchvision.transforms.v2 as T
+from torchvision.io import VideoReader
 from PIL import Image
 import sqlite3
 from pathlib import Path
@@ -16,31 +18,149 @@ from tqdm import tqdm
 
 from utils import compute_file_md5, Colors as C
 
-def get_image_paths(directories: List[str], extensions: List[str] = ['png', 'jpg', 'jpeg']) -> List[str]:
+
+def _normalize_extension(ext: str) -> str:
+    return ext.lower().lstrip('.')
+
+
+IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg']
+VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm']
+IMAGE_EXTENSION_SET = {_normalize_extension(ext) for ext in IMAGE_EXTENSIONS}
+VIDEO_EXTENSION_SET = {_normalize_extension(ext) for ext in VIDEO_EXTENSIONS}
+MEDIA_EXTENSION_SET = IMAGE_EXTENSION_SET | VIDEO_EXTENSION_SET
+
+
+def is_video_file(path: str) -> bool:
+    suffix = Path(path).suffix
+    if not suffix:
+        return False
+    return _normalize_extension(suffix) in VIDEO_EXTENSION_SET
+
+def get_image_paths(directories: List[str], extensions: Optional[List[str]] = None) -> List[str]:
+    """Collect paths to supported media (images and videos)."""
+    normalized_exts = sorted({_normalize_extension(ext) for ext in (extensions or MEDIA_EXTENSION_SET)})
     paths = []
     for directory in directories:
         # Skip magic "random" string for generative mode
         if directory.lower() == "random":
             continue
-        for ext in extensions:
+        for ext in normalized_exts:
             paths.extend(glob.glob(f"{directory}/**/*.{ext}", recursive=True))
     paths.sort()
     return paths
 
-def load_and_preprocess_image(path: str, max_size: int) -> torch.Tensor:
-    """Load an image and preprocess it to fit the model requirements."""
-    image = Image.open(path).convert("RGB")
+def _frame_tensor_to_pil(frame: torch.Tensor) -> Image.Image:
+    if frame.ndim != 3:
+        raise ValueError(f"Unexpected video frame rank: {frame.shape}")
+    tensor = frame.cpu()
+    if tensor.shape[0] <= 4:  # Likely CHW
+        tensor = tensor.permute(1, 2, 0)
+    arr = tensor.numpy()
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[:, :, None], 3, axis=2)
+    if arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    return Image.fromarray(arr).convert("RGB")
+
+
+class VideoFrameSampler:
+    """Utility for fast random access into video files."""
+
+    def __init__(self, cache_size: int = 4):
+        self.cache_size = cache_size
+        self._reader_cache: "OrderedDict[str, VideoReader]" = OrderedDict()
+        self._metadata_cache: Dict[str, Dict[str, float]] = {}
+
+    def _evict_oldest(self):
+        if not self._reader_cache:
+            return
+        old_path, _ = self._reader_cache.popitem(last=False)
+        self._metadata_cache.pop(old_path, None)
+
+    def _get_reader(self, path: str) -> VideoReader:
+        reader = self._reader_cache.get(path)
+        if reader is not None:
+            self._reader_cache.move_to_end(path)
+            return reader
+        try:
+            reader = VideoReader(path, "video")
+        except (RuntimeError, OSError) as exc:
+            raise RuntimeError(
+                f"Failed to open video '{path}'. Ensure torchvision is built with FFmpeg support."
+            ) from exc
+        self._reader_cache[path] = reader
+        if len(self._reader_cache) > self.cache_size:
+            self._evict_oldest()
+        return reader
+
+    def _get_metadata(self, path: str, reader: VideoReader) -> Dict[str, float]:
+        meta = self._metadata_cache.get(path)
+        if meta is not None:
+            return meta
+        raw_meta = reader.get_metadata().get("video", {})
+        duration = raw_meta.get("duration")
+        fps = raw_meta.get("fps")
+        frames = raw_meta.get("frames")
+        if duration is None and frames is not None and fps not in (None, 0):
+            duration = frames / fps
+        if duration is None:
+            duration = float(frames or 1) / float(fps or 30.0)
+        duration = max(duration, 1e-3)
+        meta = {"duration": duration}
+        self._metadata_cache[path] = meta
+        return meta
+
+    def _timestamp(self, selection: str, metadata: Dict[str, float]) -> float:
+        duration = metadata["duration"]
+        if selection == "random":
+            return random.uniform(0.0, max(duration - 1e-3, 0.0))
+        if selection == "middle":
+            return min(duration * 0.5, max(duration - 1e-3, 0.0))
+        raise ValueError(f"Unknown frame selection '{selection}'")
+
+    def get_frame(self, path: str, selection: str = "random") -> Image.Image:
+        reader = self._get_reader(path)
+        metadata = self._get_metadata(path, reader)
+        timestamp = self._timestamp(selection, metadata)
+        for _ in range(5):
+            reader.seek(max(timestamp, 0.0))
+            try:
+                frame = next(reader)["data"]
+                return _frame_tensor_to_pil(frame)
+            except StopIteration:
+                timestamp = self._timestamp("random", metadata)
+        reader.seek(0.0)
+        try:
+            frame = next(reader)["data"]
+        except StopIteration as exc:
+            raise RuntimeError(f"Unable to decode frames from video '{path}'") from exc
+        return _frame_tensor_to_pil(frame)
+
+
+DEFAULT_VIDEO_SAMPLER: Optional[VideoFrameSampler] = None
+
+
+def get_default_video_sampler() -> VideoFrameSampler:
+    global DEFAULT_VIDEO_SAMPLER
+    if DEFAULT_VIDEO_SAMPLER is None:
+        DEFAULT_VIDEO_SAMPLER = VideoFrameSampler()
+    return DEFAULT_VIDEO_SAMPLER
+
+
+def preprocess_pil_image(image: Image.Image, max_size: int) -> torch.Tensor:
     src_width, src_height = image.size
     prescale = 0.9 + 0.1 * random.random()
     if src_width >= src_height:
-        haspect = min(4/3, src_width / src_height)
+        haspect = min(4 / 3, src_width / src_height)
         crop_height = int(src_height * prescale)
         crop_width = int(crop_height * haspect)
         if crop_width > src_width:
             crop_width = src_width
             crop_height = int(crop_width / haspect)
     else:
-        vaspect = min(4/3, src_height / src_width)
+        vaspect = min(4 / 3, src_height / src_width)
         crop_width = int(src_width * prescale)
         crop_height = int(crop_width * vaspect)
         if crop_height > src_height:
@@ -52,8 +172,30 @@ def load_and_preprocess_image(path: str, max_size: int) -> torch.Tensor:
     image = image.resize((max_size, max_size), Image.LANCZOS)
     image_array = np.array(image).astype(np.float32) / 127.5 - 1.0
     image_array = np.transpose(image_array, (2, 0, 1))
-    image_tensor = torch.from_numpy(image_array)
-    return image_tensor
+    return torch.from_numpy(image_array)
+
+
+def load_and_preprocess_image(
+    path: str,
+    max_size: int,
+    video_sampler: Optional[VideoFrameSampler] = None,
+    frame_selection: str = "random",
+) -> torch.Tensor:
+    """Load an image or video frame and preprocess it to fit model requirements.
+
+    Args:
+        path: Path to an image or supported video file.
+        max_size: Target square resolution.
+        video_sampler: Optional sampler to reuse cached VideoReader instances.
+        frame_selection: "random" for dataloader parity or "middle" for deterministic frames.
+    """
+    if is_video_file(path):
+        sampler = video_sampler or get_default_video_sampler()
+        pil_image = sampler.get_frame(path, selection=frame_selection)
+    else:
+        with Image.open(path) as img:
+            pil_image = img.convert("RGB")
+    return preprocess_pil_image(pil_image, max_size)
 
 class RFPix2pixDataset(Dataset):
     def __init__(
@@ -105,7 +247,10 @@ class RFPix2pixDataset(Dataset):
             # Image translation mode: load images
             domain_0_idx = random.randint(0, len(self.domain_0_image_paths) - 1)
             domain_0_path = self.domain_0_image_paths[domain_0_idx]
-            domain_0_image = load_and_preprocess_image(domain_0_path, self.max_image_size)
+            domain_0_image = load_and_preprocess_image(
+                domain_0_path,
+                self.max_image_size,
+            )
             
             # Sample domain 1 image (structure-paired or random)
             if self.structure_pairing is not None:
@@ -114,7 +259,10 @@ class RFPix2pixDataset(Dataset):
                 domain_1_idx = random.randint(0, len(self.domain_1_image_paths) - 1)
         
         domain_1_path = self.domain_1_image_paths[domain_1_idx]
-        domain_1_image = load_and_preprocess_image(domain_1_path, self.max_image_size)
+        domain_1_image = load_and_preprocess_image(
+            domain_1_path,
+            self.max_image_size,
+        )
         return {'domain_0': domain_0_image, 'domain_1': domain_1_image}
     
 
@@ -527,16 +675,16 @@ def compute_structure_embeddings(
     desc: str = "Computing embeddings",
 ) -> np.ndarray:
     """
-    Compute structure embeddings for a list of images.
-    
-    Uses the embedding cache to avoid recomputing embeddings for images
+    Compute structure embeddings for a list of media files (images or videos).
+
+    Uses the embedding cache to avoid recomputing embeddings for inputs
     that have been processed in previous runs.
     
     Images are resized preserving aspect ratio (short side = 224), then
     minimally cropped to ensure dimensions are multiples of 14 for DINOv2.
     
     Args:
-        image_paths: List of image file paths
+        image_paths: List of media file paths
         encoder: StructureEncoder (DINOv2) model
         cache: EmbeddingCache for persistent storage
         desc: Description for progress bar
@@ -568,13 +716,20 @@ def compute_structure_embeddings(
     print(f"{C.DIM}  Found {C.CYAN}{n_cached}{C.RESET}{C.DIM} cached, need to compute {C.CYAN}{n_to_compute}{C.RESET}")
     
     # Compute missing embeddings
+    video_sampler: Optional[VideoFrameSampler] = None
+
     if needs_compute:
         new_embeddings = {}
         
         # Process one image at a time (images have different aspect ratios)
         for idx in tqdm(needs_compute, desc=desc):
             path = image_paths[idx]
-            img = Image.open(path).convert("RGB")
+            if is_video_file(path):
+                if video_sampler is None:
+                    video_sampler = VideoFrameSampler(cache_size=2)
+                img = video_sampler.get_frame(path, selection="middle")
+            else:
+                img = Image.open(path).convert("RGB")
             
             # Resize preserving aspect ratio (short side = DINO_TARGET_SIZE)
             w, h = img.size
@@ -645,7 +800,7 @@ def prepare_structure_pairing(
     print(f"{C.DIM}  Cache: {cache}{C.RESET}")
     
     # Compute embeddings for both domains
-    print(f"\n{C.BRIGHT_CYAN}  Domain 0:{C.RESET} {len(dataset.domain_0_image_paths)} images")
+    print(f"\n{C.BRIGHT_CYAN}  Domain 0:{C.RESET} {len(dataset.domain_0_image_paths)} media files")
     embeddings_0 = compute_structure_embeddings(
         dataset.domain_0_image_paths,
         encoder,
@@ -654,7 +809,7 @@ def prepare_structure_pairing(
         desc="Domain 0",
     )
     
-    print(f"\n{C.BRIGHT_CYAN}  Domain 1:{C.RESET} {len(dataset.domain_1_image_paths)} images")
+    print(f"\n{C.BRIGHT_CYAN}  Domain 1:{C.RESET} {len(dataset.domain_1_image_paths)} media files")
     embeddings_1 = compute_structure_embeddings(
         dataset.domain_1_image_paths,
         encoder,

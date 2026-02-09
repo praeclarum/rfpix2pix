@@ -299,7 +299,11 @@ def sample_structure_pairings(
     for d0_idx in tqdm(domain_0_indices, desc="Building proof sheet"):
         # Load domain 0 image
         d0_path = dataset.domain_0_image_paths[d0_idx]
-        d0_image = load_and_preprocess_image(d0_path, dataset.max_image_size)  # (3, H, W)
+        d0_image = load_and_preprocess_image(
+            d0_path,
+            dataset.max_image_size,
+            frame_selection="middle",
+        )  # (3, H, W)
         
         # Get top-K domain 1 candidates (already sorted by similarity)
         d1_indices = pairing.top_k_indices[d0_idx]  # (K,)
@@ -308,7 +312,11 @@ def sample_structure_pairings(
         row_images = [d0_image]
         for d1_idx in d1_indices:
             d1_path = dataset.domain_1_image_paths[d1_idx]
-            d1_image = load_and_preprocess_image(d1_path, dataset.max_image_size)  # (3, H, W)
+            d1_image = load_and_preprocess_image(
+                d1_path,
+                dataset.max_image_size,
+                frame_selection="middle",
+            )  # (3, H, W)
             row_images.append(d1_image)
         
         # Concatenate horizontally: (3, H, W*(K+1))
@@ -573,9 +581,12 @@ if __name__ == "__main__":
         num_downsamples=model.velocity_net.num_downsamples,
     )
     if dataset.use_random_noise_domain0:
-        print(f"{C.BLUE}▶ Dataset:{C.RESET} domain 0 = {C.CYAN}random noise{C.RESET}, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
+        print(f"{C.BLUE}▶ Dataset:{C.RESET} domain 0 = {C.CYAN}random noise{C.RESET}, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 media files")
     else:
-        print(f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} domain 0 images, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 images")
+        print(
+            f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} "
+            f"domain 0 media files, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 media files"
+        )
     
     # Save config to run directory
     config_save_path = os.path.join(run_dir, "config.json")
