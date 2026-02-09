@@ -1,10 +1,12 @@
 # RF Pix2Pix
 
-A neural network for **unpaired image-to-image translation** using Rectified Flow.
+A neural network for **unpaired image-to-image translation** and **image generation** using Rectified Flow.
 
 ## Overview
 
 RF Pix2Pix learns to translate images between two domains (e.g., horses ↔ zebras, day ↔ night) without requiring paired training data. Unlike traditional pix2pix which needs aligned image pairs, this approach works with separate collections of images from each domain.
+
+The model also supports **generative mode**, which creates images from random noise similar to diffusion models, providing a unified framework for both domain transfer and generation tasks.
 
 The method is based on Section 5.3 of the paper:
 
@@ -33,29 +35,58 @@ git clone https://github.com/praeclarum/rfpix2pix.git
 cd rfpix2pix
 
 # Install dependencies
-pip install torch torchvision pillow numpy
+pip install torch torchvision pillow numpy wandb
 ```
 
 ## Usage
 
-### Training
+### Modes
+
+RF Pix2Pix supports two distinct modes:
+
+**1. Image Translation Mode (Unpaired Domain Transfer)**
+
+Translates images between two domains using unpaired data (e.g., horses ↔ zebras, sketches ↔ photos). Requires separate collections of images from both domains. Uses a saliency network to guide the translation.
 
 ```bash
-# Train a new model
 python train.py --config configs/small.json \
-    --domain0 path/to/domain0/images \
-    --domain1 path/to/domain1/images
+    --domain0 path/to/horses \
+    --domain1 path/to/zebras
+```
+
+**2. Generative Mode (Noise-to-Image)**
+
+Generates images from random noise, similar to standard diffusion models. Set domain 0 to the special `"random"` keyword to sample from standard Gaussian noise N(0,1). The saliency network is bypassed and training uses simple MSE loss.
+
+```bash
+python train.py --config configs/small.json \
+    --domain0 random \
+    --domain1 path/to/faces
+```
+
+### Training Examples
+
+```bash
+# Image translation: horses to zebras
+python train.py --config configs/small.json \
+    --domain0 path/to/horses \
+    --domain1 path/to/zebras
+
+# Generative: create faces from noise
+python train.py --config configs/small.json \
+    --domain0 random \
+    --domain1 path/to/faces
 
 # Resume from checkpoint
 python train.py --config configs/small.json \
-    --domain0 path/to/domain0/images \
-    --domain1 path/to/domain1/images \
+    --domain0 path/to/domain0 \
+    --domain1 path/to/domain1 \
     --checkpoint runs/run_xxx/model_1000.ckpt
 
 # Development mode (smaller batches, more logging)
 python train.py --config configs/small.json \
-    --domain0 path/to/domain0/images \
-    --domain1 path/to/domain1/images \
+    --domain0 path/to/domain0 \
+    --domain1 path/to/domain1 \
     --dev
 ```
 
@@ -64,7 +95,7 @@ python train.py --config configs/small.json \
 | Argument | Description |
 |----------|-------------|
 | `--config`, `-c` | Path to model config JSON file (required) |
-| `--domain0`, `-d0` | Path(s) to domain 0 media directories (images and/or videos) |
+| `--domain0`, `-d0` | Path(s) to domain 0 media directories, or `"random"` for generative mode |
 | `--domain1`, `-d1` | Path(s) to domain 1 media directories (images and/or videos) |
 | `--checkpoint`, `-ckpt` | Path to checkpoint file to resume training |
 | `--run-id` | Custom run ID for output directory |
@@ -83,12 +114,13 @@ python train.py --config configs/small.json \
 
 ```
 rfpix2pix/
-├── train.py          # Training script and CLI
-├── model.py          # RFPix2pixModel with saliency and velocity networks
 ├── data.py           # Dataset for loading unpaired image/video domains
 ├── fnn.py            # Neural network utilities and config system
-└── configs/
-    └── small.json    # Example configuration for small model
+├── model.py          # RFPix2pixModel with saliency and velocity networks
+├── split.py          # Automatic domain0/domain1 splitting from uncategorized images
+├── train.py          # Training script and CLI
+├── utils.py          # Junk drawer
+└── configs/          # Example configurations
 ```
 
 ## Configuration
@@ -99,36 +131,45 @@ Models are configured via JSON files. Example (`configs/small.json`):
 {
     "type": "RFPix2pixModel",
     "max_size": 128,
-    "sample_batch_size": 4,
-    "train_batch_size": 8,
-    "train_minibatch_size": 4,
-    "train_images": 100000,
+    "sample_batch_size": 8,
+    "train_batch_size": 48,
+    "train_minibatch_size": 24,
+    "train_images": 6000000,
     "learning_rate": 0.0002,
     "num_inference_steps": 12,
     "timestep_sampling": "logit-normal",
-    "saliency_accuracy_threshold": 0.99,
+    "saliency_learning_rate": 0.00005,
+    "saliency_accuracy_threshold": 0.995,
+    "saliency_warmup_threshold": 0.90,
+    "saliency_blend_fraction": 0.0,
+    "saliency_label_smoothing": 0.1,
+    "saliency_augmentations": ["color_jitter", "grayscale", "hflip", "random_erasing"],
+    "structure_pairing": false,
+    "structure_candidates": 8,
     "velocity_net": {
         "type": "UNet",
-        "model_channels": 64,
-        "ch_mult": [1, 2, 4, 4],
-        "num_res_blocks": 2
+        "model_channels": 128,
+        "ch_mult": [1, 2, 4, 8, 8],
+        "normalization": "GroupNorm32",
+        "activation": "SiLU",
+        "num_res_blocks": 2,
+        "zero_res_blocks": false,
+        "attention_resolutions": [],
+        "num_attention_heads": 8
+    },
+    "saliency_net": {
+        "type": "ResNetSaliencyNet",
+        "backbone": "resnet50",
+        "num_classes": 2,
+        "pretrained": true,
+        "latent_channels": 512
     }
 }
 ```
 
-### Key Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `max_size` | Image resolution (images are resized to this) |
-| `train_images` | Total images to train on |
-| `learning_rate` | Optimizer learning rate |
-| `num_inference_steps` | ODE integration steps during inference |
-| `saliency_accuracy_threshold` | Required classifier accuracy before velocity training |
-| `structure_pairing` | Enable structure-aware image pairing (default: false) |
-| `structure_candidates` | Number of similar images to consider for pairing (default: 8) |
-
 ## Training Phases
+
+**Image Translation Mode:**
 
 1. **Phase 1: Saliency Training**  
    Trains the classifier to distinguish domain 0 from domain 1 until it reaches the accuracy threshold.
@@ -138,6 +179,10 @@ Models are configured via JSON files. Example (`configs/small.json`):
 
 3. **Phase 2: Velocity Training**  
    Freezes the saliency network and trains the velocity field using the saliency-weighted loss. If structure pairing is enabled, domain-1 images are selected from the top `structure_candidates` most structurally similar images for each domain-0 sample.
+
+**Generative Mode:**
+
+In generative mode (`--domain0 random`), Phase 1 and 1.5 are skipped entirely. The model proceeds directly to velocity training using simple MSE loss without saliency weighting.
 
 ### Structure-Aware Pairing
 

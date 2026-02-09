@@ -2,7 +2,7 @@
 
 This is a neural network specializing in image-to-image translation using unpaired data.
 
-It is based on Section 5.3 of the paper "Flow Straight and Fast: Learning to Generate Data and Transfer Data with Rectified Flow" by Xingchao Liu, Chenyue Gong, and Qiang Liu.
+It is based on Section 5.3 of the paper "Flow Straight and Fast: Learning to Generate Data and Transfer Data with Rectified Flow" by Xingchao Liu, Chengyue Gong, and Qiang Liu.
 
 It uses rectified flow concepts to generate a velocity vector that converts from one image domain to another.
 
