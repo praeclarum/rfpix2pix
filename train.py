@@ -395,6 +395,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Velocity Network ━━━{C.RESET}")
     print(f"{C.BRIGHT_CYAN}  Steps:{C.RESET}          {C.BOLD}{num_steps}{C.RESET}")
     print(f"{C.BRIGHT_CYAN}  Starting step:{C.RESET}  {step_start}")
+    print(f"{C.BRIGHT_CYAN}  Batch size:{C.RESET}     {rf_model.train_batch_size}")
     print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {rf_model.train_minibatch_size}")
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}\n")
