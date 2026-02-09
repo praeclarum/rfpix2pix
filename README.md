@@ -73,8 +73,10 @@ python train.py --config configs/small.json \
 ### Video Sources
 
 - Domain directories can mix still images (`.png`, `.jpg`, `.jpeg`) and video clips (`.mp4`, `.mov`, `.mkv`, `.avi`, `.webm`, `.m4v`).
-- The dataloader seeks to a random timestamp for every sample so videos contribute diverse frames while sharing the exact same preprocessing pipeline (crop, resize, normalization) as images.
-- Structure pairing computes DINO embeddings from a deterministic mid-frame so cached similarities remain stable across runs.
+- Videos are expanded into individual frame samples. A 1-minute clip at 30 fps therefore yields ~1,800 training examples and structure-pairing targets, which keeps multi-scene footage usable and makes per-frame similarity meaningful.
+- Each frame’s cache key is derived from the MD5 of the underlying video plus the frame index, so DINO embeddings are stored per-frame and remain stable across runs.
+- The dataloader still applies the same crop/resize/[-1,1] preprocessing to both images and video frames, so augmentations and normalization stay consistent.
+- Expect structure-pairing preparation to take longer on long-form footage, since every frame is hashed and embedded exactly once before training.
 - Video decoding relies on `torchvision.io.VideoReader`, so ensure your TorchVision build includes FFmpeg support (the default pip wheels do). No extra dependencies are required beyond `torch`, `torchvision`, `pillow`, and `numpy`.
 
 ## Project Structure

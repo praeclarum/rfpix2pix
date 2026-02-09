@@ -1,4 +1,5 @@
-from typing import Dict, List, Callable, Optional, Tuple
+from typing import Dict, List, Callable, Optional, Tuple, Literal
+from dataclasses import dataclass
 import os
 import gc
 import glob
@@ -30,11 +31,97 @@ VIDEO_EXTENSION_SET = {_normalize_extension(ext) for ext in VIDEO_EXTENSIONS}
 MEDIA_EXTENSION_SET = IMAGE_EXTENSION_SET | VIDEO_EXTENSION_SET
 
 
+@dataclass(frozen=True)
+class MediaItem:
+    path: str
+    media_type: Literal["image", "video"]
+    frame_index: Optional[int] = None
+    timestamp: Optional[float] = None
+
+    @property
+    def identifier(self) -> str:
+        if self.media_type == "video" and self.frame_index is not None:
+            return f"{self.path}#frame={self.frame_index}"
+        return self.path
+
+
+@dataclass(frozen=True)
+class VideoMetadata:
+    frames: int
+    fps: float
+    duration: float
+
+
+VIDEO_METADATA_CACHE: Dict[str, VideoMetadata] = {}
+
+
 def is_video_file(path: str) -> bool:
     suffix = Path(path).suffix
     if not suffix:
         return False
     return _normalize_extension(suffix) in VIDEO_EXTENSION_SET
+
+
+def _scan_video_frames(path: str) -> int:
+    reader = VideoReader(path, "video")
+    reader.seek(0.0)
+    count = 0
+    for _ in reader:
+        count += 1
+    return count
+
+
+def get_video_metadata(path: str) -> VideoMetadata:
+    cached = VIDEO_METADATA_CACHE.get(path)
+    if cached is not None:
+        return cached
+    reader = VideoReader(path, "video")
+    raw_meta = reader.get_metadata().get("video", {})
+    fps = raw_meta.get("fps") or 0.0
+    frames = raw_meta.get("frames")
+    duration = raw_meta.get("duration") or 0.0
+    if frames is None or frames <= 0:
+        print(f"{C.DIM}  Scanning video frames for metadata: {path}{C.RESET}")
+        frames = _scan_video_frames(path)
+    if fps <= 0.0:
+        if duration > 0 and frames:
+            fps = frames / duration
+        else:
+            fps = 24.0
+    if duration <= 0.0:
+        duration = frames / fps if fps else float(frames)
+    frames = max(int(frames), 0)
+    if frames == 0:
+        print(f"{C.YELLOW}⚠ Video '{path}' has zero frames; skipping.{C.RESET}")
+    metadata = VideoMetadata(frames=frames, fps=float(fps), duration=float(duration))
+    VIDEO_METADATA_CACHE[path] = metadata
+    return metadata
+
+
+def build_media_items(directories: List[str]) -> List[MediaItem]:
+    media_paths = get_image_paths(directories)
+    items: List[MediaItem] = []
+    for path in media_paths:
+        if is_video_file(path):
+            metadata = get_video_metadata(path)
+            if metadata.frames == 0:
+                continue
+            max_timestamp = max(metadata.duration - 1e-3, 0.0)
+            for frame_idx in range(metadata.frames):
+                if metadata.fps > 0:
+                    timestamp = frame_idx / metadata.fps
+                else:
+                    timestamp = 0.0
+                timestamp = min(max(timestamp, 0.0), max_timestamp)
+                items.append(MediaItem(
+                    path=path,
+                    media_type="video",
+                    frame_index=frame_idx,
+                    timestamp=timestamp,
+                ))
+        else:
+            items.append(MediaItem(path=path, media_type="image", frame_index=0, timestamp=None))
+    return items
 
 def get_image_paths(directories: List[str], extensions: Optional[List[str]] = None) -> List[str]:
     """Collect paths to supported media (images and videos)."""
@@ -95,20 +182,33 @@ class VideoFrameSampler:
             self._evict_oldest()
         return reader
 
+    def _count_frames(self, reader: VideoReader) -> int:
+        reader.seek(0.0)
+        count = 0
+        for _ in reader:
+            count += 1
+        reader.seek(0.0)
+        return count
+
     def _get_metadata(self, path: str, reader: VideoReader) -> Dict[str, float]:
         meta = self._metadata_cache.get(path)
         if meta is not None:
             return meta
         raw_meta = reader.get_metadata().get("video", {})
-        duration = raw_meta.get("duration")
-        fps = raw_meta.get("fps")
+        duration = raw_meta.get("duration") or 0.0
+        fps = raw_meta.get("fps") or 0.0
         frames = raw_meta.get("frames")
-        if duration is None and frames is not None and fps not in (None, 0):
-            duration = frames / fps
-        if duration is None:
-            duration = float(frames or 1) / float(fps or 30.0)
+        if frames is None or frames <= 0:
+            frames = self._count_frames(reader)
+        if fps <= 0.0:
+            if duration > 0 and frames:
+                fps = frames / duration
+            else:
+                fps = 24.0
+        if duration <= 0.0:
+            duration = frames / fps if fps else float(max(frames, 1))
         duration = max(duration, 1e-3)
-        meta = {"duration": duration}
+        meta = {"duration": duration, "fps": float(fps), "frames": int(frames)}
         self._metadata_cache[path] = meta
         return meta
 
@@ -120,17 +220,25 @@ class VideoFrameSampler:
             return min(duration * 0.5, max(duration - 1e-3, 0.0))
         raise ValueError(f"Unknown frame selection '{selection}'")
 
-    def get_frame(self, path: str, selection: str = "random") -> Image.Image:
+    def _clamp_timestamp(self, metadata: Dict[str, float], timestamp: float) -> float:
+        duration = metadata["duration"]
+        max_time = max(duration - 1e-3, 0.0)
+        return min(max(timestamp, 0.0), max_time)
+
+    def get_frame(self, path: str, selection: str = "random", timestamp: Optional[float] = None) -> Image.Image:
         reader = self._get_reader(path)
         metadata = self._get_metadata(path, reader)
-        timestamp = self._timestamp(selection, metadata)
+        if timestamp is not None:
+            ts = self._clamp_timestamp(metadata, timestamp)
+        else:
+            ts = self._timestamp(selection, metadata)
         for _ in range(5):
-            reader.seek(max(timestamp, 0.0))
+            reader.seek(max(ts, 0.0))
             try:
                 frame = next(reader)["data"]
                 return _frame_tensor_to_pil(frame)
             except StopIteration:
-                timestamp = self._timestamp("random", metadata)
+                ts = self._timestamp("random", metadata)
         reader.seek(0.0)
         try:
             frame = next(reader)["data"]
@@ -175,6 +283,25 @@ def preprocess_pil_image(image: Image.Image, max_size: int) -> torch.Tensor:
     return torch.from_numpy(image_array)
 
 
+def load_media_item(
+    item: MediaItem,
+    max_size: int,
+    video_sampler: Optional[VideoFrameSampler] = None,
+    selection: str = "random",
+) -> torch.Tensor:
+    if item.media_type == "video":
+        sampler = video_sampler or get_default_video_sampler()
+        pil_image = sampler.get_frame(
+            item.path,
+            selection=selection,
+            timestamp=item.timestamp,
+        )
+    else:
+        with Image.open(item.path) as img:
+            pil_image = img.convert("RGB")
+    return preprocess_pil_image(pil_image, max_size)
+
+
 def load_and_preprocess_image(
     path: str,
     max_size: int,
@@ -189,13 +316,9 @@ def load_and_preprocess_image(
         video_sampler: Optional sampler to reuse cached VideoReader instances.
         frame_selection: "random" for dataloader parity or "middle" for deterministic frames.
     """
-    if is_video_file(path):
-        sampler = video_sampler or get_default_video_sampler()
-        pil_image = sampler.get_frame(path, selection=frame_selection)
-    else:
-        with Image.open(path) as img:
-            pil_image = img.convert("RGB")
-    return preprocess_pil_image(pil_image, max_size)
+    media_type: Literal["image", "video"] = "video" if is_video_file(path) else "image"
+    item = MediaItem(path=path, media_type=media_type, frame_index=None, timestamp=None)
+    return load_media_item(item, max_size, video_sampler=video_sampler, selection=frame_selection)
 
 class RFPix2pixDataset(Dataset):
     def __init__(
@@ -206,14 +329,14 @@ class RFPix2pixDataset(Dataset):
         num_downsamples: int,
         structure_pairing: Optional["StructurePairing"] = None,
     ):
-        self.domain_0_image_paths = get_image_paths(domain_0_paths)
-        self.domain_1_image_paths = get_image_paths(domain_1_paths)
+        self.domain_0_media_items = build_media_items(domain_0_paths)
+        self.domain_1_media_items = build_media_items(domain_1_paths)
         self.max_image_size = max_size
         self.image_size_multiple = 2 ** num_downsamples
         self.structure_pairing = structure_pairing
         
         # Detect generative mode (random noise for domain 0)
-        self.use_random_noise_domain0 = len(self.domain_0_image_paths) == 0
+        self.use_random_noise_domain0 = len(self.domain_0_media_items) == 0
         
         # Warn if structure pairing is used with random domain 0
         if self.use_random_noise_domain0 and structure_pairing is not None:
@@ -222,8 +345,8 @@ class RFPix2pixDataset(Dataset):
         
         # Validate structure pairing dimensions match
         if structure_pairing is not None and not self.use_random_noise_domain0:
-            n0 = len(self.domain_0_image_paths)
-            n1 = len(self.domain_1_image_paths)
+            n0 = len(self.domain_0_media_items)
+            n1 = len(self.domain_1_media_items)
             e0 = structure_pairing.embeddings_0.shape[0]
             e1 = structure_pairing.embeddings_1.shape[0]
             if e0 != n0 or e1 != n1:
@@ -234,21 +357,21 @@ class RFPix2pixDataset(Dataset):
 
     def __len__(self):
         if self.use_random_noise_domain0:
-            return len(self.domain_1_image_paths)
-        return max(len(self.domain_0_image_paths), len(self.domain_1_image_paths))
+            return len(self.domain_1_media_items)
+        return max(len(self.domain_0_media_items), len(self.domain_1_media_items))
 
     def __getitem__(self, index):
         # Sample domain 0 image (random noise in generative mode, otherwise loaded image)
         if self.use_random_noise_domain0:
             # Generative mode: use standard normal noise (unclipped)
             domain_0_image = torch.randn(3, self.max_image_size, self.max_image_size)
-            domain_1_idx = random.randint(0, len(self.domain_1_image_paths) - 1)
+            domain_1_idx = random.randint(0, len(self.domain_1_media_items) - 1)
         else:
             # Image translation mode: load images
-            domain_0_idx = random.randint(0, len(self.domain_0_image_paths) - 1)
-            domain_0_path = self.domain_0_image_paths[domain_0_idx]
-            domain_0_image = load_and_preprocess_image(
-                domain_0_path,
+            domain_0_idx = random.randint(0, len(self.domain_0_media_items) - 1)
+            domain_0_item = self.domain_0_media_items[domain_0_idx]
+            domain_0_image = load_media_item(
+                domain_0_item,
                 self.max_image_size,
             )
             
@@ -256,11 +379,11 @@ class RFPix2pixDataset(Dataset):
             if self.structure_pairing is not None:
                 domain_1_idx = self.structure_pairing.get_paired_index(domain_0_idx)
             else:
-                domain_1_idx = random.randint(0, len(self.domain_1_image_paths) - 1)
+                domain_1_idx = random.randint(0, len(self.domain_1_media_items) - 1)
         
-        domain_1_path = self.domain_1_image_paths[domain_1_idx]
-        domain_1_image = load_and_preprocess_image(
-            domain_1_path,
+        domain_1_item = self.domain_1_media_items[domain_1_idx]
+        domain_1_image = load_media_item(
+            domain_1_item,
             self.max_image_size,
         )
         return {'domain_0': domain_0_image, 'domain_1': domain_1_image}
@@ -668,7 +791,7 @@ class EmbeddingCache:
         return f"EmbeddingCache({self.db_path}, {len(self)} entries)"
 
 def compute_structure_embeddings(
-    image_paths: list[str],
+    media_items: list[MediaItem],
     encoder: StructureEncoder,
     cache: EmbeddingCache,
     device: torch.device,
@@ -695,12 +818,23 @@ def compute_structure_embeddings(
     import numpy as np
     from PIL import Image
     
-    n_images = len(image_paths)
+    n_images = len(media_items)
     embedding_dim = encoder.embedding_dim
     
     # Compute MD5 hashes for all images
     print(f"{C.DIM}  Computing file hashes...{C.RESET}")
-    md5_hashes = [compute_file_md5(p) for p in tqdm(image_paths, desc="Hashing")]
+    video_md5_cache: Dict[str, str] = {}
+    md5_hashes: List[str] = []
+    for item in tqdm(media_items, desc="Hashing"):
+        if item.media_type == "video":
+            base = video_md5_cache.get(item.path)
+            if base is None:
+                base = compute_file_md5(item.path)
+                video_md5_cache[item.path] = base
+            frame_id = item.frame_index if item.frame_index is not None else -1
+            md5_hashes.append(f"{base}:frame:{frame_id}")
+        else:
+            md5_hashes.append(compute_file_md5(item.path))
     
     # Check cache for existing embeddings
     cached = cache.get_batch(md5_hashes)
@@ -723,13 +857,17 @@ def compute_structure_embeddings(
         
         # Process one image at a time (images have different aspect ratios)
         for idx in tqdm(needs_compute, desc=desc):
-            path = image_paths[idx]
-            if is_video_file(path):
+            item = media_items[idx]
+            if item.media_type == "video":
                 if video_sampler is None:
                     video_sampler = VideoFrameSampler(cache_size=2)
-                img = video_sampler.get_frame(path, selection="middle")
+                img = video_sampler.get_frame(
+                    item.path,
+                    selection="middle",
+                    timestamp=item.timestamp,
+                )
             else:
-                img = Image.open(path).convert("RGB")
+                img = Image.open(item.path).convert("RGB")
             
             # Resize preserving aspect ratio (short side = DINO_TARGET_SIZE)
             w, h = img.size
@@ -800,18 +938,18 @@ def prepare_structure_pairing(
     print(f"{C.DIM}  Cache: {cache}{C.RESET}")
     
     # Compute embeddings for both domains
-    print(f"\n{C.BRIGHT_CYAN}  Domain 0:{C.RESET} {len(dataset.domain_0_image_paths)} media files")
+    print(f"\n{C.BRIGHT_CYAN}  Domain 0:{C.RESET} {len(dataset.domain_0_media_items)} media frames")
     embeddings_0 = compute_structure_embeddings(
-        dataset.domain_0_image_paths,
+        dataset.domain_0_media_items,
         encoder,
         cache,
         device,
         desc="Domain 0",
     )
     
-    print(f"\n{C.BRIGHT_CYAN}  Domain 1:{C.RESET} {len(dataset.domain_1_image_paths)} media files")
+    print(f"\n{C.BRIGHT_CYAN}  Domain 1:{C.RESET} {len(dataset.domain_1_media_items)} media frames")
     embeddings_1 = compute_structure_embeddings(
-        dataset.domain_1_image_paths,
+        dataset.domain_1_media_items,
         encoder,
         cache,
         device,

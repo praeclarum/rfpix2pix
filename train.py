@@ -15,7 +15,7 @@ import wandb.wandb_run
 from PIL import Image
 
 from fnn import object_from_config, load_module, device, save_module
-from data import RFPix2pixDataset, StructurePairing, load_and_preprocess_image, prepare_structure_pairing
+from data import RFPix2pixDataset, StructurePairing, load_media_item, prepare_structure_pairing
 from model import RFPix2pixModel
 from utils import Colors as C, AccuracyTracker
 
@@ -275,18 +275,18 @@ def sample_structure_pairings(
     Generate a proof sheet showing structure pairings for debugging.
     
     Creates a grid where each row shows:
-    - Column 0: A domain 0 image
-    - Columns 1..K: Top-K most similar domain 1 images (sorted by similarity)
+    - Column 0: A domain 0 media frame
+    - Columns 1..K: Top-K most similar domain 1 media frames (sorted by similarity)
     
     Args:
-        dataset: Dataset with image paths for both domains
+        dataset: Dataset with media items for both domains
         pairing: StructurePairing object with precomputed similarities
         run_dir: Directory to save the proof sheet
         num_samples: Number of domain 0 images to sample (rows in grid)
     """
     print(f"\n{C.BOLD}{C.MAGENTA}━━━ Structure Pairing Proof Sheet ━━━{C.RESET}")
     
-    n_domain_0 = len(dataset.domain_0_image_paths)
+    n_domain_0 = len(dataset.domain_0_media_items)
     k = pairing.top_k_indices.shape[1]  # Number of candidates per image
     
     # Sample random domain 0 indices
@@ -298,11 +298,10 @@ def sample_structure_pairings(
     rows = []
     for d0_idx in tqdm(domain_0_indices, desc="Building proof sheet"):
         # Load domain 0 image
-        d0_path = dataset.domain_0_image_paths[d0_idx]
-        d0_image = load_and_preprocess_image(
-            d0_path,
+        d0_item = dataset.domain_0_media_items[d0_idx]
+        d0_image = load_media_item(
+            d0_item,
             dataset.max_image_size,
-            frame_selection="middle",
         )  # (3, H, W)
         
         # Get top-K domain 1 candidates (already sorted by similarity)
@@ -311,11 +310,10 @@ def sample_structure_pairings(
         # Build row: [domain_0, match_1, match_2, ..., match_K]
         row_images = [d0_image]
         for d1_idx in d1_indices:
-            d1_path = dataset.domain_1_image_paths[d1_idx]
-            d1_image = load_and_preprocess_image(
-                d1_path,
+            d1_item = dataset.domain_1_media_items[d1_idx]
+            d1_image = load_media_item(
+                d1_item,
                 dataset.max_image_size,
-                frame_selection="middle",
             )  # (3, H, W)
             row_images.append(d1_image)
         
@@ -581,11 +579,14 @@ if __name__ == "__main__":
         num_downsamples=model.velocity_net.num_downsamples,
     )
     if dataset.use_random_noise_domain0:
-        print(f"{C.BLUE}▶ Dataset:{C.RESET} domain 0 = {C.CYAN}random noise{C.RESET}, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 media files")
+        print(
+            f"{C.BLUE}▶ Dataset:{C.RESET} domain 0 = {C.CYAN}random noise{C.RESET}, "
+            f"{C.CYAN}{len(dataset.domain_1_media_items)}{C.RESET} domain 1 media frames"
+        )
     else:
         print(
-            f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_image_paths)}{C.RESET} "
-            f"domain 0 media files, {C.CYAN}{len(dataset.domain_1_image_paths)}{C.RESET} domain 1 media files"
+            f"{C.BLUE}▶ Dataset:{C.RESET} {C.CYAN}{len(dataset.domain_0_media_items)}{C.RESET} "
+            f"domain 0 media frames, {C.CYAN}{len(dataset.domain_1_media_items)}{C.RESET} domain 1 media frames"
         )
     
     # Save config to run directory
