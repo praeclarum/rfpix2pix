@@ -3,7 +3,7 @@
     "max_size": 128,
     "sample_batch_size": 8,
     "train_batch_size": 48,
-    "train_minibatch_size": 6,
+    "train_minibatch_size": 12,
     "train_images": 6000000,
     "learning_rate": 0.0001,
     "num_inference_steps": 12,
@@ -16,6 +16,7 @@
     "saliency_augmentations": ["color_jitter", "grayscale", "hflip", "random_erasing"],
     "structure_pairing": false,
     "structure_candidates": 8,
+    "bf16": true,
     "velocity_net": {
         "type": "DiT",
         "patch_size": 2,

@@ -28,6 +28,7 @@ class RFPix2pixModel(nn.Module):
         saliency_learning_rate: Optional[float] = None,
         structure_pairing: bool = False,
         structure_candidates: int = 8,
+        bf16: bool = False,
     ):
         super().__init__()
         self.max_size = max_size
@@ -47,6 +48,7 @@ class RFPix2pixModel(nn.Module):
         self.saliency_learning_rate = saliency_learning_rate if saliency_learning_rate is not None else learning_rate
         self.structure_pairing = structure_pairing
         self.structure_candidates = structure_candidates
+        self.bf16 = bf16
         self.velocity_net = object_from_config(
             velocity_net,
             input_channels=3,

@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 import os
 import json
 import math
@@ -549,6 +549,10 @@ class DiT(nn.Module):
         # --- Final layer ---
         self.final_layer = DiTFinalLayer(hidden_size, patch_size, output_channels)
 
+        # Cached positional embeddings (lazily populated in forward)
+        self._cached_pos_emb: Optional[torch.Tensor] = None
+        self._cached_pos_hw: tuple[int, int] = (0, 0)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -594,8 +598,9 @@ class DiT(nn.Module):
         """
         p = self.patch_size
         c = self.output_channels
+        # (B, h, w, p, p, c) -> (B, c, h, p, w, p) -> (B, c, h*p, w*p)
         x = x.reshape(x.shape[0], h, w, p, p, c)
-        x = torch.einsum("nhwpqc->nchpwq", x)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
         return x.reshape(x.shape[0], c, h * p, w * p)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -614,9 +619,11 @@ class DiT(nn.Module):
         B, D, Hp, Wp = x.shape
         x = x.flatten(2).transpose(1, 2)               # (B, T, D)
 
-        # Add 2-D sin-cos positional embedding (computed dynamically)
-        pos_emb = get_2d_sincos_pos_embed(self.hidden_size, Hp, Wp, device=x.device)
-        x = x + pos_emb.unsqueeze(0)                   # broadcast over batch
+        # Add 2-D sin-cos positional embedding (cached for repeated resolutions)
+        if self._cached_pos_hw != (Hp, Wp) or self._cached_pos_emb is None or self._cached_pos_emb.device != x.device:
+            self._cached_pos_emb = get_2d_sincos_pos_embed(self.hidden_size, Hp, Wp, device=x.device)
+            self._cached_pos_hw = (Hp, Wp)
+        x = x + self._cached_pos_emb.unsqueeze(0)       # broadcast over batch
 
         # Timestep conditioning
         c = get_timestep_embedding(t, self.hidden_size) # (B, D)

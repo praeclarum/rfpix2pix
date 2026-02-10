@@ -1,5 +1,6 @@
 import gc
 import random
+from contextlib import nullcontext
 from typing import Optional
 import argparse
 import os
@@ -431,8 +432,10 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             input_domain_1 = inputs["domain_1"].to(device)  # (B, 3, H, W)
             
             # Compute saliency-weighted velocity loss
-            output = rf_model.compute_loss(input_domain_0, input_domain_1)
-            loss = output['loss']
+            autocast_ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16) if rf_model.bf16 else nullcontext() # pyright: ignore[reportPrivateImportUsage]
+            with autocast_ctx:
+                output = rf_model.compute_loss(input_domain_0, input_domain_1)
+                loss = output['loss']
             grad_loss: torch.Tensor = loss * grad_scale
             grad_loss.backward()
 
