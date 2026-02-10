@@ -356,6 +356,283 @@ class UNet(nn.Module):
         return y
 register_type("UNet", UNet)
 
+
+#
+# DiT (Diffusion Transformer)
+#
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Apply adaptive shift and scale to normalized token sequences.
+    x: (B, T, D), shift/scale: (B, D) → broadcast over T."""
+    return x * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def get_2d_sincos_pos_embed(embed_dim: int, grid_h: int, grid_w: int, device: torch.device) -> torch.Tensor:
+    """
+    Compute 2D sin-cos positional embeddings on the fly.
+
+    Args:
+        embed_dim: total embedding dimension (must be divisible by 2; each spatial
+                   axis uses embed_dim//2).
+        grid_h: number of patch rows
+        grid_w: number of patch columns
+        device: target device
+
+    Returns:
+        (grid_h * grid_w, embed_dim) tensor of positional embeddings
+    """
+    assert embed_dim % 2 == 0, "embed_dim must be even"
+    half = embed_dim // 2
+    # Build 1-D frequency bands (half // 2 freqs per axis)
+    omega = torch.arange(half // 2, device=device, dtype=torch.float32)
+    omega = 1.0 / (10000.0 ** (omega / (half // 2)))
+    # Grid positions
+    pos_h = torch.arange(grid_h, device=device, dtype=torch.float32)
+    pos_w = torch.arange(grid_w, device=device, dtype=torch.float32)
+    # Outer products → (grid, freqs)
+    out_h = pos_h[:, None] * omega[None, :]  # (grid_h, half//2)
+    out_w = pos_w[:, None] * omega[None, :]  # (grid_w, half//2)
+    # Sin/cos interleave for each axis → (grid, half)
+    emb_h = torch.cat([torch.sin(out_h), torch.cos(out_h)], dim=1)  # (grid_h, half)
+    emb_w = torch.cat([torch.sin(out_w), torch.cos(out_w)], dim=1)  # (grid_w, half)
+    # Broadcast to 2-D grid: (grid_h, grid_w, embed_dim)
+    emb = torch.cat([
+        emb_h[:, None, :].expand(-1, grid_w, -1),
+        emb_w[None, :, :].expand(grid_h, -1, -1),
+    ], dim=2)  # (grid_h, grid_w, embed_dim)
+    return emb.reshape(grid_h * grid_w, embed_dim)
+
+
+class DiTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    Uses pre-norm LayerNorm (no learned affine), with per-sample adaptive
+    shift, scale, and gate regressed from the conditioning vector.
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        assert hidden_size % num_heads == 0, (
+            f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
+        )
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+
+        # Pre-norms (un-affine)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        # Self-attention (QKV fused projection)
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.attn_out = nn.Linear(hidden_size, hidden_size, bias=True)
+
+        # MLP
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden, hidden_size),
+        )
+
+        # adaLN modulation: produces 6 vectors (shift, scale, gate) x2
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, D) token sequence
+            c: (B, D) conditioning vector
+        Returns:
+            (B, T, D) output tokens
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=1)
+        )
+
+        # --- Attention path ---
+        h = modulate(self.norm1(x), shift_msa, scale_msa)
+        B, T, D = h.shape
+        qkv = self.qkv(h).reshape(B, T, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, T, head_dim)
+        q, k, v = qkv.unbind(0)
+        h = F.scaled_dot_product_attention(q, k, v)  # (B, heads, T, head_dim)
+        h = h.transpose(1, 2).reshape(B, T, D)
+        h = self.attn_out(h)
+        x = x + gate_msa.unsqueeze(1) * h
+
+        # --- MLP path ---
+        h = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        h = self.mlp(h)
+        x = x + gate_mlp.unsqueeze(1) * h
+
+        return x
+
+
+class DiTFinalLayer(nn.Module):
+    """
+    Final layer of DiT: adaLN modulation (shift + scale only, no gate)
+    followed by a linear projection to patch_size^2 * out_channels.
+    """
+
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+class DiT(nn.Module):
+    """
+    Diffusion Transformer for velocity prediction.
+
+    Drop-in replacement for UNet:  forward(x, t) -> velocity, same shapes.
+    Based on "Scalable Diffusion Models with Transformers" (Peebles & Xie, 2022).
+
+    Config parameters:
+        patch_size   (int)  : patch tokenisation stride (image dims must be divisible)
+        hidden_size  (int)  : transformer width
+        depth        (int)  : number of DiTBlocks
+        num_heads    (int)  : attention heads (must divide hidden_size)
+        mlp_ratio    (float): MLP hidden dim = hidden_size * mlp_ratio
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int,
+        patch_size: int = 2,
+        hidden_size: int = 384,
+        depth: int = 12,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        self.dtype = torch.float32
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        # Reuse the existing divisibility infrastructure:
+        # data.py computes image_size_multiple = 2 ** num_downsamples
+        self.num_downsamples = int(math.log2(patch_size)) if patch_size > 1 else 0
+
+        # --- Patch embedding (Conv2d acts as linear projection of flattened patches) ---
+        self.x_embedder = nn.Conv2d(
+            input_channels, hidden_size,
+            kernel_size=patch_size, stride=patch_size, bias=True,
+        )
+
+        # --- Timestep conditioning ---
+        self.t_embedder = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+
+        # --- Transformer blocks ---
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_size, num_heads, mlp_ratio) for _ in range(depth)
+        ])
+
+        # --- Final layer ---
+        self.final_layer = DiTFinalLayer(hidden_size, patch_size, output_channels)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        """Weight init following the DiT paper."""
+        # Xavier uniform for all Linear layers
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Patch embedding: treat Conv2d as linear
+        w = self.x_embedder.weight.data
+        nn.init.xavier_uniform_(w.view(w.shape[0], -1))
+        nn.init.constant_(self.x_embedder.bias, 0) # pyright: ignore[reportArgumentType]
+
+        # Timestep MLP
+        nn.init.normal_(self.t_embedder[0].weight, std=0.02) # pyright: ignore[reportArgumentType]
+        nn.init.normal_(self.t_embedder[2].weight, std=0.02) # pyright: ignore[reportArgumentType]
+
+        # Zero-out adaLN modulation outputs in every block
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0) # type: ignore
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0) # type: ignore
+
+        # Zero-out final layer outputs
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0) # type: ignore
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0) # type: ignore
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def unpatchify(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """
+        Reshape patch tokens back to a spatial image.
+
+        Args:
+            x: (B, T, patch_size**2 * C_out)
+            h: number of patch rows
+            w: number of patch columns
+        Returns:
+            (B, C_out, H, W) image tensor
+        """
+        p = self.patch_size
+        c = self.output_channels
+        x = x.reshape(x.shape[0], h, w, p, p, c)
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        return x.reshape(x.shape[0], c, h * p, w * p)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) input tensor
+            t: (B,) flow timestep in [0, 1]
+
+        Returns:
+            (B, C_out, H, W) predicted velocity
+        """
+        p = self.patch_size
+
+        # Patchify: (B, C, H, W) -> (B, D, H', W') -> (B, T, D)
+        x = self.x_embedder(x)                        # (B, D, H', W')
+        B, D, Hp, Wp = x.shape
+        x = x.flatten(2).transpose(1, 2)               # (B, T, D)
+
+        # Add 2-D sin-cos positional embedding (computed dynamically)
+        pos_emb = get_2d_sincos_pos_embed(self.hidden_size, Hp, Wp, device=x.device)
+        x = x + pos_emb.unsqueeze(0)                   # broadcast over batch
+
+        # Timestep conditioning
+        c = get_timestep_embedding(t, self.hidden_size) # (B, D)
+        c = self.t_embedder(c)                          # (B, D)
+
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x, c)                             # (B, T, D)
+
+        # Final projection + unpatchify
+        x = self.final_layer(x, c)                      # (B, T, p*p*C_out)
+        x = self.unpatchify(x, Hp, Wp)                  # (B, C_out, H, W)
+        return x
+register_type("DiT", DiT)
+
+
 #
 # LOSS
 #
