@@ -18,9 +18,9 @@
     "velocity_net": {
         "type": "DiT",
         "patch_size": 2,
-        "hidden_size": 384,
-        "depth": 6,
-        "num_heads": 6,
+        "hidden_size": 256,
+        "depth": 12,
+        "num_heads": 4,
         "mlp_ratio": 4.0
     },
     "saliency_net": {
