@@ -3,7 +3,9 @@ from dataclasses import dataclass
 import os
 import gc
 import glob
+import io
 import random
+import zipfile
 from collections import OrderedDict
 import numpy as np
 import torch
@@ -26,22 +28,27 @@ def _normalize_extension(ext: str) -> str:
 
 IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg']
 VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'avi', 'mkv', 'webm']
+ZIP_EXTENSIONS = ['zip']
 IMAGE_EXTENSION_SET = {_normalize_extension(ext) for ext in IMAGE_EXTENSIONS}
 VIDEO_EXTENSION_SET = {_normalize_extension(ext) for ext in VIDEO_EXTENSIONS}
-MEDIA_EXTENSION_SET = IMAGE_EXTENSION_SET | VIDEO_EXTENSION_SET
+ZIP_EXTENSION_SET = {_normalize_extension(ext) for ext in ZIP_EXTENSIONS}
+MEDIA_EXTENSION_SET = IMAGE_EXTENSION_SET | VIDEO_EXTENSION_SET | ZIP_EXTENSION_SET
 
 
 @dataclass(frozen=True)
 class MediaItem:
     path: str
-    media_type: Literal["image", "video"]
+    media_type: Literal["image", "video", "zip_image"]
     frame_index: Optional[int] = None
     timestamp: Optional[float] = None
+    member_name: Optional[str] = None
 
     @property
     def identifier(self) -> str:
         if self.media_type == "video" and self.frame_index is not None:
             return f"{self.path}#frame={self.frame_index}"
+        if self.media_type == "zip_image" and self.member_name is not None:
+            return f"{self.path}#member={self.member_name}"
         return self.path
 
 
@@ -60,6 +67,13 @@ def is_video_file(path: str) -> bool:
     if not suffix:
         return False
     return _normalize_extension(suffix) in VIDEO_EXTENSION_SET
+
+
+def is_zip_file(path: str) -> bool:
+    suffix = Path(path).suffix
+    if not suffix:
+        return False
+    return _normalize_extension(suffix) in ZIP_EXTENSION_SET
 
 
 def _scan_video_frames(path: str) -> int:
@@ -98,6 +112,21 @@ def get_video_metadata(path: str) -> VideoMetadata:
     return metadata
 
 
+def _enumerate_zip_images(zip_path: str) -> List[str]:
+    """List image members inside a ZIP archive, sorted for deterministic ordering."""
+    members = []
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for name in zf.namelist():
+            # Skip directories and hidden/macOS resource fork files
+            if name.endswith('/') or '/__MACOSX/' in name or name.startswith('__MACOSX/'):
+                continue
+            ext = Path(name).suffix
+            if ext and _normalize_extension(ext) in IMAGE_EXTENSION_SET:
+                members.append(name)
+    members.sort()
+    return members
+
+
 def build_media_items(directories: List[str]) -> List[MediaItem]:
     media_paths = get_image_paths(directories)
     items: List[MediaItem] = []
@@ -118,6 +147,18 @@ def build_media_items(directories: List[str]) -> List[MediaItem]:
                     media_type="video",
                     frame_index=frame_idx,
                     timestamp=timestamp,
+                ))
+        elif is_zip_file(path):
+            members = _enumerate_zip_images(path)
+            if not members:
+                print(f"{C.YELLOW}⚠ ZIP '{path}' contains no images; skipping.{C.RESET}")
+                continue
+            for member_idx, member_name in enumerate(members):
+                items.append(MediaItem(
+                    path=path,
+                    media_type="zip_image",
+                    frame_index=member_idx,
+                    member_name=member_name,
                 ))
         else:
             items.append(MediaItem(path=path, media_type="image", frame_index=0, timestamp=None))
@@ -283,6 +324,13 @@ def preprocess_pil_image(image: Image.Image, max_size: int) -> torch.Tensor:
     return torch.from_numpy(image_array)
 
 
+def load_zip_image(zip_path: str, member_name: str) -> Image.Image:
+    """Extract and open a single image from inside a ZIP archive."""
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        data = zf.read(member_name)
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
 def load_media_item(
     item: MediaItem,
     max_size: int,
@@ -296,6 +344,10 @@ def load_media_item(
             selection=selection,
             timestamp=item.timestamp,
         )
+    elif item.media_type == "zip_image":
+        if item.member_name is None:
+            raise ValueError(f"ZIP media item missing member name: {item}")
+        pil_image = load_zip_image(item.path, item.member_name)
     else:
         with Image.open(item.path) as img:
             pil_image = img.convert("RGB")
@@ -823,16 +875,22 @@ def compute_structure_embeddings(
     
     # Compute MD5 hashes for all images
     print(f"{C.DIM}  Computing file hashes...{C.RESET}")
-    video_md5_cache: Dict[str, str] = {}
+    container_md5_cache: Dict[str, str] = {}
     md5_hashes: List[str] = []
     for item in tqdm(media_items, desc="Hashing"):
         if item.media_type == "video":
-            base = video_md5_cache.get(item.path)
+            base = container_md5_cache.get(item.path)
             if base is None:
                 base = compute_file_md5(item.path)
-                video_md5_cache[item.path] = base
+                container_md5_cache[item.path] = base
             frame_id = item.frame_index if item.frame_index is not None else -1
             md5_hashes.append(f"{base}:frame:{frame_id}")
+        elif item.media_type == "zip_image":
+            base = container_md5_cache.get(item.path)
+            if base is None:
+                base = compute_file_md5(item.path)
+                container_md5_cache[item.path] = base
+            md5_hashes.append(f"{base}:member:{item.member_name}")
         else:
             md5_hashes.append(compute_file_md5(item.path))
     
@@ -866,6 +924,8 @@ def compute_structure_embeddings(
                     selection="middle",
                     timestamp=item.timestamp,
                 )
+            elif item.media_type == "zip_image":
+                img = load_zip_image(item.path, item.member_name)
             else:
                 img = Image.open(item.path).convert("RGB")
             
