@@ -407,12 +407,12 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}\n")
 
-    sample_steps = 64
-    max_sample_steps = 512
-    next_sample_step = step_start + sample_steps
+    sample_minutes = 1
+    max_sample_minutes = 8
+    last_sample_time = datetime.datetime.now()
 
-    save_steps = 1024
-    next_save_step = step_start + save_steps
+    save_minutes = 30
+    last_save_time = datetime.datetime.now()
 
     progress = tqdm(range(step_start, last_step), initial=step_start, total=last_step - step_start)
     for step in progress:
@@ -456,14 +456,14 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             }
             wandb_run.log(wlog)
 
-        if step >= next_sample_step:
+        if (datetime.datetime.now() - last_sample_time).total_seconds() >= sample_minutes * 60:
             sample(rf_model, dataset, run_dir, f"step_{step:06d}")
-            sample_steps = min(sample_steps * 2, max_sample_steps)
-            next_sample_step = step + sample_steps
+            sample_minutes = min(sample_minutes * 2, max_sample_minutes)
+            last_sample_time = datetime.datetime.now()
         
-        if step >= next_save_step:
+        if (datetime.datetime.now() - last_save_time).total_seconds() >= save_minutes * 60:
             save(step)
-            next_save_step = step + save_steps
+            last_save_time = datetime.datetime.now()
 
     # Final save
     save(last_step)
