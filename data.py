@@ -438,9 +438,9 @@ class RFPix2pixDataset(Dataset):
         return {'domain_0': domain_0_image, 'domain_1': domain_1_image}
     
 
-class SaliencyAugmentation(nn.Module):
+class ImageAugmentation(nn.Module):
     """
-    Data augmentation for saliency network training.
+    Data augmentation for image training.
     
     Wraps torchvision transforms to work with [-1, 1] colorspace.
     Converts to [0, 1] before transforms, then back to [-1, 1] after.
@@ -450,6 +450,7 @@ class SaliencyAugmentation(nn.Module):
         - "grayscale": Random grayscale conversion (p=0.1)
         - "random_erasing": Random rectangular patch erasure
         - "gaussian_blur": Random Gaussian blur
+        - "hflip": Random horizontal flip
     """
     
     def __init__(self, augmentations: List[str]):
@@ -502,7 +503,7 @@ class SaliencyAugmentation(nn.Module):
                 # Random horizontal flip
                 transforms.append(T.RandomHorizontalFlip(p=0.5))
             else:
-                raise ValueError(f"Unknown saliency augmentation: {aug}")
+                raise ValueError(f"Unknown augmentation: {aug}")
         
         self.transform = T.Compose(transforms)
     

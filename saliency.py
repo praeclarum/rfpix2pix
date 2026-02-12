@@ -4,7 +4,7 @@ from typing import Optional, List
 import torch
 
 from fnn import *
-from data import SaliencyAugmentation
+from data import ImageAugmentation
 
 
 class Saliency(nn.Module):
@@ -46,7 +46,7 @@ class Saliency(nn.Module):
         self.blend_fraction = blend_fraction
         self.label_smoothing = label_smoothing
         self.augmentations = augmentations
-        self.augment = SaliencyAugmentation(augmentations)
+        self.augment = ImageAugmentation(augmentations)
 
     @property
     def output_channels(self) -> int:

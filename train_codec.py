@@ -136,9 +136,15 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}")
     print(f"{C.BRIGHT_CYAN}  Losses:{C.RESET}         {', '.join(l.id for l in codec.loss_fns)}") # type: ignore
+    if codec.augmentations:
+        print(f"{C.BRIGHT_CYAN}  Augmentations:{C.RESET}  {', '.join(codec.augmentations)}")
     if has_backbone:
         print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}")
     print()
+
+    # Generate augmentation grid at start of training for visual verification
+    if codec.augmentations:
+        sample_codec_augmentations(rf_model, dataset, run_dir, wandb_run=wandb_run)
 
     save_minutes = 30
     last_save_time = datetime.datetime.now()
@@ -171,10 +177,12 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
 
             # Train on real images only (skip random noise domain)
             x1 = inputs["domain_1"].to(device)
+            x1 = codec.augment(x1)
             if dataset.use_random_noise_domain0:
                 x = x1  # Don't train codec on random noise
             else:
                 x0 = inputs["domain_0"].to(device)
+                x0 = codec.augment(x0)
                 x = torch.cat([x0, x1], dim=0)  # (2B, 3, H, W)
 
             output = codec.compute_loss(x)
@@ -274,3 +282,35 @@ def sample_codec_reconstruction(
     print(f"Saved codec grid to {path} ({image.width}x{image.height})")
     if wandb_run is not None:
         wandb_run.log({"codec_reconstruction": wandb.Image(path)})
+
+
+@torch.no_grad()
+def sample_codec_augmentations(
+    rf_model: RFPix2pixModel,
+    dataset: RFPix2pixDataset,
+    run_dir: str,
+    num_images: int = 4,
+    num_augmentations: int = 6,
+    wandb_run: Optional[wandb.wandb_run.Run] = None,
+):
+    """Generate a grid showing [original | aug1 | aug2 | ...] for each image to visualize augmentations."""
+    rf_model.eval()
+    codec = rf_model.codec
+    rows = []
+    for i in range(num_images):
+        inputs = dataset[random.randint(0, len(dataset) - 1)]
+        x = inputs["domain_1"].unsqueeze(0).to(device)  # (1, 3, H, W)
+        cols = [x]
+        for _ in range(num_augmentations):
+            cols.append(codec.augment(x))
+        row = torch.cat(cols, dim=3)  # (1, 3, H, (1+N)*W)
+        rows.append(row)
+    image = torch.cat(rows, dim=2)  # (1, 3, H*M, (1+N)*W)
+    image = (image.squeeze(0).cpu().numpy() + 1.0) * 127.5
+    image = image.clip(0, 255).astype("uint8")
+    image = Image.fromarray(image.transpose(1, 2, 0))
+    path = os.path.join(run_dir, "codec_augmentations.jpg")
+    image.save(path, quality=90)
+    print(f"Saved codec augmentation grid to {path} ({image.width}x{image.height})")
+    if wandb_run is not None:
+        wandb_run.log({"codec_augmentations": wandb.Image(path)})

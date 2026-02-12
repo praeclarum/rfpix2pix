@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fnn import *
+from data import ImageAugmentation
 
 class Codec(nn.Module):
     """
@@ -55,6 +56,7 @@ class Codec(nn.Module):
         self.warmup_threshold = warmup_threshold
         self.sample_batch_size = sample_batch_size
         self.augmentations = augmentations
+        self.augment = ImageAugmentation(augmentations)
 
     @property
     def out_channels(self) -> int:
