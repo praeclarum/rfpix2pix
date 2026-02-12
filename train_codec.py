@@ -255,8 +255,15 @@ def sample_codec_reconstruction(
     for i in range(num_samples):
         inputs = dataset[random.randint(0, len(dataset) - 1)]
         x = inputs["domain_1"].unsqueeze(0).to(device)  # (1, 3, H, W)
-        x_hat = rf_model.codec(x)  # encode -> decode
-        row = torch.cat([x, x_hat], dim=3)  # (1, 3, H, 2W)
+        enc = rf_model.codec.net.encode_params(x)
+        z = enc["z"]  # (1, C, H', W')
+        x_hat = rf_model.codec.net.decode(z)
+        # Visualize first 3 latent channels, scaled to [-1, 1]
+        z_vis = z[:, :3, :, :]  # (1, 3, H', W')
+        z_vis = (z_vis / 4.0).clamp(-1, 1)  # scale assuming ~N(0,1) latents
+        z_vis = torch.nn.functional.interpolate(z_vis, size=x.shape[2:], mode="nearest")  # upscale
+        z_vis = z_vis.clamp(-1, 1)
+        row = torch.cat([x, x_hat, z_vis], dim=3)  # (1, 3, H, 3W)
         rows.append(row)
     image = torch.cat(rows, dim=2)  # (1, 3, H*N, 2W)
     image = (image.squeeze(0).cpu().numpy() + 1.0) * 127.5

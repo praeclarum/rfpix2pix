@@ -121,10 +121,11 @@ if __name__ == "__main__":
     # Resolve domain paths: CLI overrides config
     domain0_paths = args.domain0 if args.domain0 is not None else config.get("domain0", [])
     domain1_paths = args.domain1 if args.domain1 is not None else config.get("domain1", [])
-    
     if not domain0_paths or not domain1_paths:
         print(f"{C.RED}Error: domain0 and domain1 must be specified via CLI (--domain0, --domain1) or in config.{C.RESET}")
         exit(1)
+    config["domain0"] = domain0_paths
+    config["domain1"] = domain1_paths
     
     # Generate run ID
     date_id = datetime.datetime.now().strftime("%Y%m%d%H%M")
@@ -143,21 +144,21 @@ if __name__ == "__main__":
     step_start = 0
     if args.codec_ckpt:
         print(f"{C.BLUE}▶ Loading codec from {C.BOLD}{args.codec_ckpt}{C.RESET}")
-        model.codec = load_module(args.codec_ckpt).to(device)
+        model.codec = load_module(args.codec_ckpt).to(device) # type: ignore
         # Copy codec state from the checkpoint's run directory
         prev_run_dir = os.path.dirname(args.codec_ckpt)
         _copy_state_file(prev_run_dir, run_dir, CODEC_STATE_FILE)
     
     if args.saliency_ckpt:
         print(f"{C.BLUE}▶ Loading saliency from {C.BOLD}{args.saliency_ckpt}{C.RESET}")
-        model.saliency = load_module(args.saliency_ckpt).to(device)
+        model.saliency = load_module(args.saliency_ckpt).to(device) # type: ignore
         # Copy saliency state from the checkpoint's run directory
         prev_run_dir = os.path.dirname(args.saliency_ckpt)
         _copy_state_file(prev_run_dir, run_dir, SALIENCY_STATE_FILE)
     
     if args.velocity_ckpt:
         print(f"{C.BLUE}▶ Loading velocity from {C.BOLD}{args.velocity_ckpt}{C.RESET}")
-        model.velocity = load_module(args.velocity_ckpt).to(device)
+        model.velocity = load_module(args.velocity_ckpt).to(device) # type: ignore
         # Extract step from checkpoint filename (e.g., velocity_run_xxx_001000.ckpt -> 1000)
         step_start = int(args.velocity_ckpt.split("_")[-1].split(".")[0])
         print(f"{C.BLUE}▶ Resuming velocity from step {C.CYAN}{step_start}{C.RESET}")
@@ -166,8 +167,8 @@ if __name__ == "__main__":
     
     # Create dataset
     dataset = RFPix2pixDataset(
-        domain_0_paths=domain0_paths,
-        domain_1_paths=domain1_paths,
+        domain_0_paths=config["domain0"],
+        domain_1_paths=config["domain1"],
         max_size=model.max_size,
         num_downsamples=model.velocity.num_downsamples,
     )
@@ -192,8 +193,8 @@ if __name__ == "__main__":
     data_save_path = os.path.join(run_dir, "data.json")
     with open(data_save_path, "w") as f:
         json.dump({
-            "domain0_paths": domain0_paths,
-            "domain1_paths": domain1_paths,
+            "domain0_paths": config["domain0"],
+            "domain1_paths": config["domain1"],
         }, f, indent=2)
     print(f"{C.BLUE}▶ Saved data to {C.BOLD}{data_save_path}{C.RESET}\n")
 
@@ -234,8 +235,8 @@ if __name__ == "__main__":
             if structure_pairing is not None:
                 # Recreate dataset with structure pairing
                 dataset = RFPix2pixDataset(
-                    domain_0_paths=domain0_paths,
-                    domain_1_paths=domain1_paths,
+                    domain_0_paths=config["domain0"],
+                    domain_1_paths=config["domain1"],
                     max_size=model.max_size,
                     num_downsamples=model.velocity.num_downsamples,
                     structure_pairing=structure_pairing,

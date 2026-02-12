@@ -59,7 +59,7 @@ def compute_velocity_loss(
         z1 = codec.encode(x1)  # (B, C, H', W')
 
     # Reshape t for broadcasting: (B,) -> (B, 1, 1, 1)
-    t_broadcast = t[:, None, None, None]
+    t_broadcast = t[:, None, None, None] # type: ignore
     
     # Linear interpolation in latent space: z_t = t * z1 + (1 - t) * z0
     z_t = t_broadcast * z1 + (1 - t_broadcast) * z0

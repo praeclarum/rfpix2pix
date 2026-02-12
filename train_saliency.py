@@ -215,7 +215,7 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     saliency = rf_model.saliency
     codec = rf_model.codec
 
-    batch_size = saliency.net.__config.get("train_batch_size", 48) if hasattr(saliency.net, "__config") else 48
+    batch_size = saliency.net.__config.get("train_batch_size", 48) if hasattr(saliency.net, "__config") else 48 # type: ignore
     # Use velocity's batch sizes as defaults since saliency doesn't own them
     vel = rf_model.velocity
     batch_size = vel.train_batch_size
