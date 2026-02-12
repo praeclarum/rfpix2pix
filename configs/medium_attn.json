@@ -8,23 +8,35 @@
     "learning_rate": 0.0002,
     "num_inference_steps": 12,
     "timestep_sampling": "logit-normal",
-    "saliency_learning_rate": 0.00005,
+    "saliency_learning_rate": 5e-05,
     "saliency_accuracy_threshold": 0.995,
-    "saliency_warmup_threshold": 0.90,
+    "saliency_warmup_threshold": 0.9,
     "saliency_blend_fraction": 0.0,
     "saliency_label_smoothing": 0.1,
-    "saliency_augmentations": ["color_jitter", "grayscale", "hflip", "random_erasing"],
+    "saliency_augmentations": [
+        "color_jitter",
+        "grayscale",
+        "hflip",
+        "random_erasing"
+    ],
     "structure_pairing": false,
     "structure_candidates": 8,
     "velocity_net": {
         "type": "UNet",
         "model_channels": 96,
-        "ch_mult": [1, 2, 4, 8],
+        "ch_mult": [
+            1,
+            2,
+            4,
+            8
+        ],
         "normalization": "GroupNorm32",
         "activation": "SiLU",
         "num_res_blocks": 2,
         "zero_res_blocks": false,
-        "attention_resolutions": [3],
+        "attention_resolutions": [
+            3
+        ],
         "num_attention_heads": 8
     },
     "saliency_net": {
@@ -33,5 +45,10 @@
         "num_classes": 2,
         "pretrained": true,
         "latent_channels": 512
+    },
+    "codec": {
+        "net": {
+            "type": "IdentityNet"
+        }
     }
 }

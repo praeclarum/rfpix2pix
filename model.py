@@ -29,6 +29,7 @@ class RFPix2pixModel(nn.Module):
         structure_pairing: bool = False,
         structure_candidates: int = 8,
         bf16: bool = False,
+        codec: Config = {"net": {"type": "IdentityNet"}},
     ):
         super().__init__()
         self.max_size = max_size
@@ -49,18 +50,37 @@ class RFPix2pixModel(nn.Module):
         self.structure_pairing = structure_pairing
         self.structure_candidates = structure_candidates
         self.bf16 = bf16
+        # Codec: encode/decode between pixel and latent space
+        self.codec: Codec = object_from_config(codec, type="Codec")
+        latent_ch = self.codec.out_channels
         self.velocity_net = object_from_config(
             velocity_net,
-            input_channels=3,
-            output_channels=3,
+            input_channels=latent_ch,
+            output_channels=latent_ch,
         )
         self.num_downsamples = self.velocity_net.num_downsamples
-        self.saliency_net: SaliencyNet = object_from_config(saliency_net)
+        self.saliency_net: SaliencyNet = object_from_config(
+            saliency_net,
+            in_channels=latent_ch,
+        )
         self.saliency_channels = self.saliency_net.output_channels
         # Generative mode flag (set by dataset during training)
         self.is_generative = False
-        # Start with saliency network frozen (alternating training phases)
+        # Start with codec and saliency network frozen
+        self.eval_codec()
         self.eval_saliency()
+
+    def eval_codec(self):
+        """Freeze codec for downstream training phases."""
+        for param in self.codec.parameters():
+            param.requires_grad = False
+        self.codec.eval()
+
+    def train_codec(self):
+        """Unfreeze codec for codec training phase."""
+        for param in self.codec.parameters():
+            param.requires_grad = True
+        self.codec.train()
 
     def eval_saliency(self):
         """Freeze saliency network for velocity training phase."""
@@ -79,7 +99,7 @@ class RFPix2pixModel(nn.Module):
         Get domain classification logits from saliency network.
         
         Args:
-            x: (B, 3, H, W) input images
+            x: (B, C, H, W) input in latent space (or pixel space if IdentityNet)
             
         Returns:
             (B, num_classes) classification logits (typically 2 for domain 0/1)
@@ -94,17 +114,13 @@ class RFPix2pixModel(nn.Module):
         """
         Compute classification loss for training the saliency network.
         
-        The saliency network learns to distinguish domain 0 from domain 1.
-        This provides meaningful gradients for the style-transfer loss.
-        
-        Supports blended training: a fraction of the batch uses interpolated
-        images x_t = t*x1 + (1-t)*x0 with soft labels [1-t, t]. This exposes
-        the classifier to the same distribution it will see during velocity
-        training, potentially improving Jacobian quality.
+        Images are encoded through the frozen codec before classification.
+        The saliency network learns to distinguish domain 0 from domain 1
+        in latent space.
         
         Args:
-            x0: (B, 3, H, W) images from domain 0
-            x1: (B, 3, H, W) images from domain 1
+            x0: (B, 3, H, W) images from domain 0 (pixel space)
+            x1: (B, 3, H, W) images from domain 1 (pixel space)
             
         Returns:
             dict with:
@@ -114,6 +130,11 @@ class RFPix2pixModel(nn.Module):
         B = x0.shape[0]
         device = x0.device
         dtype = x0.dtype
+
+        # Encode through frozen codec to latent space
+        with torch.no_grad():
+            z0 = self.codec.encode(x0)  # (B, C, H', W')
+            z1 = self.codec.encode(x1)  # (B, C, H', W')
         
         # Determine how many samples use blended interpolation vs pure domains
         num_blends = int(B * self.saliency_blend_fraction)
@@ -141,39 +162,31 @@ class RFPix2pixModel(nn.Module):
         
         t = torch.cat(t_parts, dim=0)  # (2B,)
         
-        # Construct input images for interpolation x_t = t*x1 + (1-t)*x0
-        # Each t value needs a corresponding (x0, x1) pair:
-        # - At t=0: x_t = x0 (domain 0 images)
-        # - At t=1: x_t = x1 (domain 1 images)
-        # - At t in (0,1): x_t = blend
-        x0_parts = []
-        x1_parts = []
+        # Construct input latents for interpolation z_t = t*z1 + (1-t)*z0
+        z0_parts = []
+        z1_parts = []
         
         if num_pure > 0:
-            # Domain 0 samples (t=0): x_t = 0*x1 + 1*x0 = x0
-            x0_parts.append(x0[:num_pure])
-            x1_parts.append(x1[:num_pure])  # Doesn't matter, multiplied by 0
-            
-            # Domain 1 samples (t=1): x_t = 1*x1 + 0*x0 = x1
-            x0_parts.append(x0[:num_pure])  # Doesn't matter, multiplied by 0
-            x1_parts.append(x1[:num_pure])
+            z0_parts.append(z0[:num_pure])
+            z1_parts.append(z1[:num_pure])
+            z0_parts.append(z0[:num_pure])
+            z1_parts.append(z1[:num_pure])
         
         if num_blends > 0:
-            # Blended samples: need proper (x0, x1) pairs
-            x0_parts.append(x0[num_pure:])
-            x0_parts.append(x0[num_pure:])
-            x1_parts.append(x1[num_pure:])
-            x1_parts.append(x1[num_pure:])
+            z0_parts.append(z0[num_pure:])
+            z0_parts.append(z0[num_pure:])
+            z1_parts.append(z1[num_pure:])
+            z1_parts.append(z1[num_pure:])
         
-        x0_all = torch.cat(x0_parts, dim=0)  # (2B, 3, H, W)
-        x1_all = torch.cat(x1_parts, dim=0)  # (2B, 3, H, W)
+        z0_all = torch.cat(z0_parts, dim=0)  # (2B, C, H', W')
+        z1_all = torch.cat(z1_parts, dim=0)  # (2B, C, H', W')
         
-        # Compute interpolated images: x_t = t*x1 + (1-t)*x0
+        # Compute interpolated latents: z_t = t*z1 + (1-t)*z0
         t_broadcast = t[:, None, None, None]  # (2B, 1, 1, 1)
-        x_t = t_broadcast * x1_all + (1 - t_broadcast) * x0_all  # (2B, 3, H, W)
+        z_t = t_broadcast * z1_all + (1 - t_broadcast) * z0_all  # (2B, C, H', W')
         
-        # Get classification logits
-        logits = self.get_saliency(x_t)  # (2B, num_classes)
+        # Get classification logits from latent inputs
+        logits = self.get_saliency(z_t)  # (2B, num_classes)
         
         # Soft targets: [1-t, t] for each sample
         # At t=0: [1, 0] = domain 0, at t=1: [0, 1] = domain 1
@@ -226,60 +239,65 @@ class RFPix2pixModel(nn.Module):
 
     def forward(self, x0: torch.Tensor, x1: torch.Tensor, t: torch.Tensor) -> dict:
         """
-        Training forward pass with flow matching.
+        Training forward pass with flow matching in latent space.
         
-        Computes the interpolated state x_t and predicts the velocity field.
-        For rectified flow: x_t = t * x1 + (1 - t) * x0, target velocity = x1 - x0
+        Images are encoded through the frozen codec to latent space,
+        then interpolated and velocity-predicted in that space.
         
         Args:
-            x0: (B, 3, H, W) source domain image
-            x1: (B, 3, H, W) target domain image
+            x0: (B, 3, H, W) source domain image (pixel space)
+            x1: (B, 3, H, W) target domain image (pixel space)
             t: (B,) timesteps in [0, 1]
             
         Returns:
             dict with:
-                - v_pred: (B, 3, H, W) predicted velocity
-                - v_target: (B, 3, H, W) target velocity (x1 - x0)
-                - x_t: (B, 3, H, W) interpolated state
+                - v_pred: (B, C, H', W') predicted velocity in latent space
+                - v_target: (B, C, H', W') target velocity in latent space
+                - z_t: (B, C, H', W') interpolated latent state
         """
+        # Encode to latent space (codec is frozen)
+        with torch.no_grad():
+            z0 = self.codec.encode(x0)  # (B, C, H', W')
+            z1 = self.codec.encode(x1)  # (B, C, H', W')
+
         # Reshape t for broadcasting: (B,) -> (B, 1, 1, 1)
         t_broadcast = t[:, None, None, None]
         
-        # Linear interpolation: x_t = t * x1 + (1 - t) * x0
-        x_t = t_broadcast * x1 + (1 - t_broadcast) * x0
+        # Linear interpolation in latent space: z_t = t * z1 + (1 - t) * z0
+        z_t = t_broadcast * z1 + (1 - t_broadcast) * z0
         
-        # Target velocity for rectified flow
-        v_target = x1 - x0
+        # Target velocity in latent space
+        v_target = z1 - z0
         
-        # Predict velocity at interpolated state
-        v_pred = self.velocity_net(x_t, t)
+        # Predict velocity at interpolated latent state
+        v_pred = self.velocity_net(z_t, t)
         
         return {
             "v_pred": v_pred,
             "v_target": v_target,
-            "x_t": x_t,
+            "z_t": z_t,
         }
 
     def compute_loss(self, x0: torch.Tensor, x1: torch.Tensor, t: Optional[torch.Tensor] = None) -> dict:
         """
-        Compute saliency-weighted rectified flow matching loss.
+        Compute saliency-weighted rectified flow matching loss in latent space.
         
-        From the paper: min_v ∫ E[||∇h(x_t)^T * (x1 - x0 - v(x_t, t))||²] dt
+        From the paper: min_v ∫ E[||∇h(z_t)^T * (z1 - z0 - v(z_t, t))||²] dt
         
-        The saliency network h(x) provides a feature mapping, and ∇h(x_t)^T acts
-        as a saliency score that re-weights coordinates so the loss focuses on
+        The saliency network h(z) operates on latent representations, and ∇h(z_t)^T
+        acts as a saliency score that re-weights coordinates so the loss focuses on
         penalizing errors that cause significant changes in feature space.
         
         Args:
-            x0: (B, 3, H, W) source domain image
-            x1: (B, 3, H, W) target domain image  
+            x0: (B, 3, H, W) source domain image (pixel space)
+            x1: (B, 3, H, W) target domain image (pixel space)
             t: (B,) timesteps in [0, 1], if None will be sampled
             
         Returns:
             dict with:
                 - loss: scalar saliency-weighted MSE loss
-                - v_pred: predicted velocity
-                - v_target: target velocity
+                - v_pred: predicted velocity (latent space)
+                - v_target: target velocity (latent space)
                 - jvp_result: (B, saliency_channels) JVP result for analysis
         """
         from torch.autograd.functional import jvp
@@ -292,46 +310,31 @@ class RFPix2pixModel(nn.Module):
         out = self.forward(x0, x1, t)
         v_pred = out["v_pred"]
         v_target = out["v_target"]
-        x_t = out["x_t"]
+        z_t = out["z_t"]
         
-        # Velocity error: v_target - v_pred
+        # Velocity error in latent space: v_target - v_pred
         # NOTE: v_pred has gradients connected to velocity_net
-        v_error = v_target - v_pred  # (B, 3, H, W)
+        v_error = v_target - v_pred  # (B, C, H', W')
         
         if self.is_generative:
             # Generative mode: simple MSE loss (no saliency weighting)
-            # This is standard Rectified Flow: min_v E[||v_target - v_pred||²]
             loss = (v_error ** 2).mean()
             jvp_result = None
         else:
-            # Image translation mode: saliency-weighted loss
-            # Compute saliency-weighted loss: ||J_h(x_t) @ v_error||²
-            # where J_h is the Jacobian of saliency_net
-            #
-            # The JVP computes: J_h @ v_error, giving shape (B, saliency_channels)
-            # 
-            # GRADIENT FLOW:
-            # - x_t is detached: saliency_net params won't receive gradients from x_t
-            # - v_error retains grad_fn: backprop flows through v_error -> v_pred -> velocity_net
-            # - create_graph=True: ensures the JVP op is in the computation graph
+            # Image translation mode: saliency-weighted loss in latent space
+            # Compute: ||J_h(z_t) @ v_error||²
             
-            def saliency_latent_fn(x):
-                # Use get_latent to get the feature representation h(x)
-                # saliency_net should be frozen (requires_grad=False on params)
-                return self.saliency_net.get_latent(x)
+            def saliency_latent_fn(z):
+                return self.saliency_net.get_latent(z)
             
-            # Compute JVP: J_h(x_t) @ v_error
-            # x_t.detach() ensures no gradient flows through the "primal" input
-            # v_error is the "tangent" and retains its gradient connection
+            # JVP: J_h(z_t) @ v_error
             _, jvp_result = jvp(
                 saliency_latent_fn,
-                (x_t.detach(),),  # primal: detached interpolated state
+                (z_t.detach(),),  # primal: detached interpolated latent
                 (v_error,),       # tangent: velocity error (has gradients!)
-                create_graph=True # keep in computation graph for backprop
+                create_graph=True
             )
-            # jvp_result: (B, saliency_channels) - velocity error in feature space
             
-            # Loss: MSE of saliency-weighted velocity error
             loss = (jvp_result ** 2).mean() # pyright: ignore[reportOperatorIssue]
         
         return {
@@ -350,33 +353,32 @@ class RFPix2pixModel(nn.Module):
         """
         Generate image from a single input image.
         
+        Encodes to latent space, integrates velocity ODE, decodes back to pixels.
+        
         Args:
-            x0: (B, 3, H, W) input image
+            x0: (B, 3, H, W) input image (pixel space)
             num_steps: number of flow integration steps (default: self.num_inference_steps)
             
         Returns:
-            x1: (B, 3, H, W) generated image
+            x1: (B, 3, H, W) generated image (pixel space)
         """
         if num_steps is None:
             num_steps = self.num_inference_steps
-            
-        B, C, H, W = x0.shape
 
-        z = x0 # Initial state
+        # Encode to latent space
+        z = self.codec.encode(x0)  # (B, C, H', W')
+        B = z.shape[0]
 
-        # Euler integration with uniform steps
+        # Euler integration in latent space
         dt = 1.0 / num_steps
         for step_idx in range(num_steps):
             t_val = step_idx * dt
-            t = torch.full((B,), t_val, device=x0.device, dtype=x0.dtype)
-            
-            # Predict velocity
+            t = torch.full((B,), t_val, device=z.device, dtype=z.dtype)
             v = self.velocity_net(z, t)
-            
-            # Euler step
             z = z + v * dt
         
-        return z
+        # Decode back to pixel space
+        return self.codec.decode(z)
 
 register_type("RFPix2pixModel", RFPix2pixModel)
 
@@ -478,8 +480,13 @@ class ResNetSaliencyNet(SaliencyNet):
     Uses a pretrained ResNet backbone from torchvision to extract features,
     then classifies whether an image belongs to domain 0 or domain 1.
     
-    Handles colorspace conversion from app's [-1, 1] range to ImageNet
-    normalization (mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]).
+    When in_channels=3 (pixel space): uses full pretrained backbone with
+    ImageNet normalization.
+    
+    When in_channels!=3 (latent space): replaces the aggressive initial
+    downsampling (conv1 stride=2 + maxpool stride=2) with a gentle
+    Conv2d(in_channels, 64, 3, stride=1, padding=1). Skips ImageNet
+    normalization since latents aren't in that distribution.
     """
     
     # ResNet backbone output channels for each variant
@@ -501,21 +508,25 @@ class ResNetSaliencyNet(SaliencyNet):
         num_classes: int = 2,
         pretrained: bool = True,
         latent_channels: int = 512,
+        in_channels: int = 3,
     ):
         """
         Initialize ResNet saliency network.
         
         Args:
-            backbone: ResNet variant to use ("resnet18", "resnet34", "resnet50", 
-                      "resnet101", "resnet152")
+            backbone: ResNet variant to use
             num_classes: Number of domain classes (typically 2)
             pretrained: Whether to use ImageNet pretrained weights
             latent_channels: Dimension of the latent feature space h(x)
+            in_channels: Number of input channels (3 for pixel space,
+                        codec.out_channels for latent space)
         """
         super().__init__()
         self.num_classes = num_classes
         self.latent_channels = latent_channels
         self._output_channels = latent_channels
+        self.in_channels = in_channels
+        self._use_imagenet_norm = (in_channels == 3)
         
         if backbone not in self.BACKBONE_CHANNELS:
             raise ValueError(
@@ -534,7 +545,7 @@ class ResNetSaliencyNet(SaliencyNet):
         )
         
         # Load pretrained backbone
-        self.backbone = self._create_backbone(backbone, pretrained)
+        self.backbone = self._create_backbone(backbone, pretrained, in_channels)
         backbone_out_channels = self.BACKBONE_CHANNELS[backbone]
         
         # Global average pooling
@@ -546,7 +557,7 @@ class ResNetSaliencyNet(SaliencyNet):
         # Classification head
         self.classifier = nn.Linear(latent_channels, num_classes)
     
-    def _create_backbone(self, backbone: str, pretrained: bool) -> nn.Module:
+    def _create_backbone(self, backbone: str, pretrained: bool, in_channels: int) -> nn.Module:
         """Create ResNet backbone without the final FC layer."""
         if backbone == "resnet18":
             from torchvision.models import resnet18, ResNet18_Weights
@@ -571,16 +582,34 @@ class ResNetSaliencyNet(SaliencyNet):
         else:
             raise ValueError(f"Unknown backbone: {backbone}")
         
-        return nn.Sequential(
-            base.conv1,
-            base.bn1,
-            base.relu,
-            base.maxpool,
-            base.layer1,
-            base.layer2,
-            base.layer3,
-            base.layer4,
-        )
+        if in_channels == 3:
+            # Standard pixel-space path: keep pretrained conv1+bn1+relu+maxpool
+            return nn.Sequential(
+                base.conv1,
+                base.bn1,
+                base.relu,
+                base.maxpool,
+                base.layer1,
+                base.layer2,
+                base.layer3,
+                base.layer4,
+            )
+        else:
+            # Latent-space path: replace conv1(7x7,stride=2)+maxpool(stride=2)
+            # with a gentle Conv2d(in_channels, 64, 3, stride=1, padding=1)
+            # to avoid aggressive downsampling on already-small latent maps.
+            input_conv = nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1)
+            nn.init.kaiming_normal_(input_conv.weight, mode='fan_out', nonlinearity='relu')
+            return nn.Sequential(
+                input_conv,
+                base.bn1,
+                base.relu,
+                # No maxpool — preserve spatial resolution
+                base.layer1,
+                base.layer2,
+                base.layer3,
+                base.layer4,
+            )
     
     def freeze_backbone(self):
         """
@@ -637,15 +666,13 @@ class ResNetSaliencyNet(SaliencyNet):
     
     def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Convert from app's [-1, 1] colorspace to ImageNet normalization.
+        Normalize input for the backbone.
         
-        App colorspace: [-1, 1]
-        ImageNet expects: (x - mean) / std where x is in [0, 1]
-        
-        Conversion:
-            1. [-1, 1] -> [0, 1]: x_01 = (x + 1) / 2
-            2. [0, 1] -> ImageNet: (x_01 - mean) / std
+        For pixel-space inputs (in_channels=3): converts [-1, 1] to ImageNet normalization.
+        For latent-space inputs: passes through unchanged.
         """
+        if not self._use_imagenet_norm:
+            return x
         # Convert [-1, 1] to [0, 1]
         x_01 = (x + 1.0) / 2.0
         # Apply ImageNet normalization
@@ -662,7 +689,7 @@ class ResNetSaliencyNet(SaliencyNet):
         Get latent feature representation h(x).
         
         Args:
-            x: (B, 3, H, W) input images in [-1, 1] range
+            x: (B, C, H, W) input (pixel or latent space depending on in_channels)
             
         Returns:
             (B, latent_channels) latent features
@@ -679,7 +706,7 @@ class ResNetSaliencyNet(SaliencyNet):
         Forward pass for domain classification.
         
         Args:
-            x: (B, 3, H, W) input images in [-1, 1] range
+            x: (B, C, H, W) input (pixel or latent space depending on in_channels)
             
         Returns:
             (B, num_classes) classification logits

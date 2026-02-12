@@ -21,6 +21,7 @@ from model import RFPix2pixModel
 from utils import Colors as C, AccuracyTracker
 
 SALIENCY_STATE_FILE = "saliency_state.json"
+CODEC_STATE_FILE = "codec_state.json"
 
 
 def read_saliency_state(run_dir: str) -> dict:
@@ -118,6 +119,212 @@ def is_backbone_warmed_up(run_dir: str) -> bool:
     return state["backbone_warmed_up"]
 
 
+#
+# CODEC STATE
+#
+def read_codec_state(run_dir: str) -> dict:
+    """Read the codec training state from the state file."""
+    state_path = os.path.join(run_dir, CODEC_STATE_FILE)
+    default_state = {
+        "trained": False,
+        "loss": None,
+        "backbone_warmed_up": False,
+    }
+    if not os.path.exists(state_path):
+        return default_state
+    try:
+        with open(state_path, "r") as f:
+            state = json.load(f)
+            for key, default_value in default_state.items():
+                if key not in state:
+                    state[key] = default_value
+            return state
+    except (ValueError, IOError):
+        return default_state
+
+
+def write_codec_state(run_dir: str, trained: bool | None = None, loss: float | None = None, backbone_warmed_up: bool | None = None):
+    """Update the codec training state file."""
+    state = read_codec_state(run_dir)
+    if trained is not None:
+        state["trained"] = trained
+    if loss is not None:
+        state["loss"] = loss
+        print(f"{C.DIM}Saved codec loss: {C.CYAN}{loss:.6f}{C.RESET}")
+    if backbone_warmed_up is not None:
+        state["backbone_warmed_up"] = backbone_warmed_up
+    state_path = os.path.join(run_dir, CODEC_STATE_FILE)
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def should_train_codec(rf_model: RFPix2pixModel, run_dir: str) -> bool:
+    """Check if codec training is needed."""
+    if rf_model.codec.train_images <= 0:
+        return False
+    state = read_codec_state(run_dir)
+    if state["trained"]:
+        print(f"{C.GREEN}✓ Codec already trained (loss={state['loss']:.6f}), skipping.{C.RESET}")
+        return False
+    print(f"{C.YELLOW}⚠ Codec training needed ({rf_model.codec.train_images} images).{C.RESET}")
+    return True
+
+
+def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, dev: bool) -> float:
+    """
+    Train the codec (encoder/decoder) on both domains.
+    
+    Trains using the configured losses (e.g., L1 + LPIPS + KL for a VAE).
+    Supports backbone warmup for pretrained encoder nets.
+    
+    Returns:
+        Final loss value.
+    """
+    rf_model.train_codec()
+    rf_model.eval_saliency()
+    rf_model.to(device)
+
+    codec = rf_model.codec
+    lr = codec.learning_rate
+
+    num_steps = codec.train_images // rf_model.train_batch_size
+    last_step = num_steps
+
+    # Check if backbone warmup was already completed (resuming)
+    codec_state = read_codec_state(run_dir)
+    backbone_already_warmed = codec_state["backbone_warmed_up"]
+
+    def create_optimizer(backbone_frozen: bool) -> torch.optim.AdamW:
+        param_groups = codec.get_optimizer_param_groups(lr, backbone_frozen)
+        return torch.optim.AdamW(param_groups, betas=(0.9, 0.999), weight_decay=1e-4)
+
+    has_backbone = codec.has_backbone()
+    if has_backbone and not backbone_already_warmed:
+        codec.freeze_backbone()
+        backbone_frozen = True
+    elif has_backbone and backbone_already_warmed:
+        codec.unfreeze_backbone()
+        backbone_frozen = False
+    else:
+        backbone_frozen = False
+
+    optimizer = create_optimizer(backbone_frozen)
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset, batch_size=rf_model.train_minibatch_size, shuffle=True, num_workers=8
+    )
+    data_iter = iter(dataloader)
+
+    run_id = os.path.basename(run_dir)
+
+    def save(step: int):
+        save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
+
+    num_grad_acc_steps = max(1, rf_model.train_batch_size // rf_model.train_minibatch_size)
+    grad_scale = 1.0 / num_grad_acc_steps
+
+    print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Codec ━━━{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Steps:{C.RESET}          {C.BOLD}{num_steps}{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {rf_model.train_minibatch_size}")
+    print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
+    print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}")
+    print(f"{C.BRIGHT_CYAN}  Losses:{C.RESET}         {', '.join(l.id for l in codec.loss_fns)}")
+    if has_backbone:
+        print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}")
+    print()
+
+    save_steps = 1024
+    next_save_step = save_steps
+
+    latest_loss = 0.0
+    loss_tracker = AccuracyTracker()  # Reuse for loss smoothing
+
+    progress = tqdm(range(0, last_step), initial=0, total=last_step)
+    for step in progress:
+        optimizer.zero_grad()
+
+        loss_item = 0.0
+        loss_details: dict = {}
+
+        for grad_step in range(num_grad_acc_steps):
+            try:
+                inputs = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                inputs = next(data_iter)
+
+            # Train on both domains: concatenate domain 0 and domain 1
+            x0 = inputs["domain_0"].to(device)
+            x1 = inputs["domain_1"].to(device)
+            x = torch.cat([x0, x1], dim=0)  # (2B, 3, H, W)
+
+            output = codec.compute_loss(x)
+            loss = output["loss"]
+            grad_loss: torch.Tensor = loss * grad_scale
+            grad_loss.backward()
+
+            loss_item += grad_loss.item()
+            # Accumulate per-loss details
+            for k, v in output.items():
+                if k not in ("loss", "x_hat"):
+                    loss_details[k] = loss_details.get(k, 0.0) + v * grad_scale
+
+        optimizer.step()
+        gc.collect()
+
+        latest_loss = loss_item
+        loss_tracker.update(loss_item)
+
+        postfix = {"loss": f"{loss_item:.4f}"}
+        for k, v in loss_details.items():
+            postfix[k] = f"{v:.4f}"
+        progress.set_postfix(postfix)
+
+        if step >= next_save_step:
+            save(step)
+            next_save_step = step + save_steps
+
+        # Backbone warmup transition (if applicable)
+        if has_backbone and backbone_frozen and codec.warmup_threshold is not None:
+            if loss_tracker.is_stable and loss_tracker.smoothed < codec.warmup_threshold:
+                print(f"\n{C.BOLD}{C.GREEN}✓ Codec backbone warmup complete{C.RESET} at step {C.CYAN}{step}{C.RESET}")
+                codec.unfreeze_backbone()
+                optimizer = create_optimizer(backbone_frozen=False)
+                backbone_frozen = False
+                loss_tracker.reset()
+                save(step)
+                write_codec_state(run_dir, backbone_warmed_up=True)
+
+    save(last_step)
+    write_codec_state(run_dir, trained=True, loss=latest_loss)
+    print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Codec training complete{C.RESET} (loss={C.CYAN}{latest_loss:.6f}{C.RESET})\n")
+
+    # Generate reconstruction grid for visual verification
+    sample_codec_reconstruction(rf_model, dataset, run_dir)
+
+    return latest_loss
+
+
+@torch.no_grad()
+def sample_codec_reconstruction(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, num_samples: int = 8):
+    """Generate a grid showing [original | reconstructed] pairs for codec quality check."""
+    rf_model.eval()
+    rows = []
+    for i in range(num_samples):
+        inputs = dataset[random.randint(0, len(dataset) - 1)]
+        x = inputs["domain_1"].unsqueeze(0).to(device)  # (1, 3, H, W)
+        x_hat = rf_model.codec(x)  # encode -> decode
+        row = torch.cat([x, x_hat], dim=3)  # (1, 3, H, 2W)
+        rows.append(row)
+    image = torch.cat(rows, dim=2)  # (1, 3, H*N, 2W)
+    image = (image.squeeze(0).cpu().numpy() + 1.0) * 127.5
+    image = image.clip(0, 255).astype("uint8")
+    image = Image.fromarray(image.transpose(1, 2, 0))
+    path = os.path.join(run_dir, "codec_reconstruction.jpg")
+    image.save(path, quality=90)
+    print(f"Saved codec reconstruction grid to {path} ({image.width}x{image.height})")
+
+
 def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, dev: bool) -> float:
     """
     Train the saliency network until it reaches acceptable accuracy.
@@ -125,6 +332,8 @@ def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     Returns:
         Final accuracy as a float (0.0 to 1.0)
     """
+    # Ensure codec is frozen, saliency is trainable
+    rf_model.eval_codec()
     rf_model.train_saliency()
     rf_model.to(device)
 
@@ -352,7 +561,8 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
         step_start: Step to resume from (0 for fresh start)
         dev: If True, skip wandb logging
     """
-    # Ensure saliency is frozen, velocity is trainable
+    # Ensure codec and saliency are frozen, velocity is trainable
+    rf_model.eval_codec()
     rf_model.eval_saliency()
     rf_model.velocity_net.train()
     rf_model.to(device)
@@ -523,6 +733,11 @@ Examples:
         action="store_true",
         help="Only train the saliency network (Phase 1), skip velocity training"
     )
+    parser.add_argument(
+        "--codec-only",
+        action="store_true",
+        help="Only train the codec (Phase 0), skip saliency and velocity training"
+    )
     
     return parser.parse_args()
 
@@ -560,6 +775,12 @@ if __name__ == "__main__":
             shutil.copy(
                 os.path.join(prev_run_dir, SALIENCY_STATE_FILE),
                 os.path.join(run_dir, SALIENCY_STATE_FILE)
+            )
+        prev_codec_state_path = os.path.join(prev_run_dir, CODEC_STATE_FILE)
+        if os.path.exists(prev_codec_state_path):
+            shutil.copy(
+                os.path.join(prev_run_dir, CODEC_STATE_FILE),
+                os.path.join(run_dir, CODEC_STATE_FILE)
             )
         try:
             data_paths = json.load(open(os.path.join(prev_run_dir, "data.json"), "r"))
@@ -624,25 +845,34 @@ if __name__ == "__main__":
     # Set generative mode flag on model
     model.is_generative = dataset.use_random_noise_domain0
     
-    # Phase 1: Train saliency network if needed (skip in generative mode)
-    if model.is_generative:
-        print(f"{C.CYAN}ℹ Generative mode: skipping saliency network training (simple MSE loss).{C.RESET}")
-    elif should_train_saliency(run_dir, model.saliency_accuracy_threshold):
-        final_accuracy = train_saliency(model, dataset, run_dir, dev=args.dev)
-        write_saliency_state(run_dir, accuracy=final_accuracy)
+    # Phase 0: Train codec if needed
+    if should_train_codec(model, run_dir):
+        train_codec(model, dataset, run_dir, dev=args.dev)
+    # Freeze codec for all downstream phases
+    model.eval_codec()
     
-    if args.saliency_only:
-        print(f"{C.GREEN}✓ Saliency-only mode: skipping velocity training.{C.RESET}")
+    if args.codec_only:
+        print(f"{C.GREEN}✓ Codec-only mode: skipping saliency and velocity training.{C.RESET}")
     else:
-        if structure_pairing is not None:
-            # Recreate dataset with structure pairing
-            dataset = RFPix2pixDataset(
-                domain_0_paths=args.domain0,
-                domain_1_paths=args.domain1,
-                max_size=model.max_size,
-                num_downsamples=model.velocity_net.num_downsamples,
-                structure_pairing=structure_pairing,
-            )
-        
-        # Phase 2: Train velocity network
-        train_velocity(model, dataset, run_dir, step_start=step_start, dev=args.dev)
+        # Phase 1: Train saliency network if needed (skip in generative mode)
+        if model.is_generative:
+            print(f"{C.CYAN}ℹ Generative mode: skipping saliency network training (simple MSE loss).{C.RESET}")
+        elif should_train_saliency(run_dir, model.saliency_accuracy_threshold):
+            final_accuracy = train_saliency(model, dataset, run_dir, dev=args.dev)
+            write_saliency_state(run_dir, accuracy=final_accuracy)
+    
+        if args.saliency_only:
+            print(f"{C.GREEN}✓ Saliency-only mode: skipping velocity training.{C.RESET}")
+        else:
+            if structure_pairing is not None:
+                # Recreate dataset with structure pairing
+                dataset = RFPix2pixDataset(
+                    domain_0_paths=args.domain0,
+                    domain_1_paths=args.domain1,
+                    max_size=model.max_size,
+                    num_downsamples=model.velocity_net.num_downsamples,
+                    structure_pairing=structure_pairing,
+                )
+            
+            # Phase 2: Train velocity network
+            train_velocity(model, dataset, run_dir, step_start=step_start, dev=args.dev)
