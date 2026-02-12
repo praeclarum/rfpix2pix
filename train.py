@@ -223,14 +223,11 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
         wandb_run: Optional[wandb.wandb_run.Run] = None
     else:
         wandb_run: Optional[wandb.wandb_run.Run] = wandb.init(
-            project="rfpix2pix_gen" if getattr(rf_model, 'is_generative', False) else "rfpix2pix",
+            project="rfpix2pix_codec",
             save_code=True,
             id=run_id,
             config=rf_model.__config,  # pyright: ignore[reportArgumentType]
         )
-
-    def save(step: int):
-        save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
 
     num_grad_acc_steps = max(1, batch_size // minibatch_size)
     grad_scale = 1.0 / num_grad_acc_steps
@@ -246,8 +243,17 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
         print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}")
     print()
 
-    save_steps = 1024
-    next_save_step = save_steps
+    save_minutes = 30
+    last_save_time = datetime.datetime.now()
+
+    sample_minutes = 1
+    max_sample_minutes = 8
+    last_sample_time = datetime.datetime.now()
+
+    def save(step: int):
+        save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
+        nonlocal last_save_time
+        last_save_time = datetime.datetime.now()
 
     latest_loss = 0.0
     loss_tracker = AccuracyTracker()  # Reuse for loss smoothing
@@ -302,9 +308,14 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
                 wlog[f"codec_{k}"] = v
             wandb_run.log(wlog)
 
-        if step >= next_save_step:
+        if (datetime.datetime.now() - last_sample_time).total_seconds() >= sample_minutes * 60:
+            sample_codec_reconstruction(rf_model, dataset, run_dir, label=f"step_{step:06d}", wandb_run=wandb_run)
+            rf_model.train_codec()
+            sample_minutes = min(sample_minutes * 2, max_sample_minutes)
+            last_sample_time = datetime.datetime.now()
+
+        if (datetime.datetime.now() - last_save_time).total_seconds() >= save_minutes * 60:
             save(step)
-            next_save_step = step + save_steps
 
         # Backbone warmup transition (if applicable)
         if has_backbone and backbone_frozen and codec.warmup_threshold is not None:
@@ -323,20 +334,24 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     write_codec_state(run_dir, trained=True, loss=latest_loss)
     print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Codec training complete{C.RESET} (loss={C.CYAN}{latest_loss:.6f}{C.RESET})\n")
 
-    # Generate reconstruction grid for visual verification
-    sample_codec_reconstruction(rf_model, dataset, run_dir)
+    # Generate final reconstruction grid for visual verification
+    sample_codec_reconstruction(rf_model, dataset, run_dir, wandb_run=wandb_run)
 
     if wandb_run is not None:
-        recon_path = os.path.join(run_dir, "codec_reconstruction.jpg")
-        if os.path.exists(recon_path):
-            wandb_run.log({"codec_reconstruction": wandb.Image(recon_path)})
         wandb_run.finish()
 
     return latest_loss
 
 
 @torch.no_grad()
-def sample_codec_reconstruction(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, num_samples: int = 8):
+def sample_codec_reconstruction(
+    rf_model: RFPix2pixModel,
+    dataset: RFPix2pixDataset,
+    run_dir: str,
+    label: str = "final",
+    num_samples: int = 8,
+    wandb_run: Optional[wandb.wandb_run.Run] = None,
+):
     """Generate a grid showing [original | reconstructed] pairs for codec quality check."""
     rf_model.eval()
     rows = []
@@ -350,9 +365,11 @@ def sample_codec_reconstruction(rf_model: RFPix2pixModel, dataset: RFPix2pixData
     image = (image.squeeze(0).cpu().numpy() + 1.0) * 127.5
     image = image.clip(0, 255).astype("uint8")
     image = Image.fromarray(image.transpose(1, 2, 0))
-    path = os.path.join(run_dir, "codec_reconstruction.jpg")
+    path = os.path.join(run_dir, f"codec_reconstruction_{label}.jpg")
     image.save(path, quality=90)
     print(f"Saved codec reconstruction grid to {path} ({image.width}x{image.height})")
+    if wandb_run is not None:
+        wandb_run.log({"codec_reconstruction": wandb.Image(path)})
 
 
 def train_saliency(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, dev: bool) -> float:

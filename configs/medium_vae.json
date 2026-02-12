@@ -37,7 +37,7 @@
     "velocity_net": {
         "type": "UNet",
         "model_channels": 96,
-        "ch_mult": [1, 2, 4, 8],
+        "ch_mult": [1, 2, 4],
         "normalization": "GroupNorm32",
         "activation": "SiLU",
         "num_res_blocks": 2,
