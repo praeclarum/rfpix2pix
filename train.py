@@ -186,8 +186,10 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
 
     codec = rf_model.codec
     lr = codec.learning_rate
+    batch_size = codec.train_batch_size if codec.train_batch_size is not None else rf_model.train_batch_size
+    minibatch_size = codec.train_minibatch_size if codec.train_minibatch_size is not None else rf_model.train_minibatch_size
 
-    num_steps = codec.train_images // rf_model.train_batch_size
+    num_steps = codec.train_images // batch_size
     last_step = num_steps
 
     # Check if backbone warmup was already completed (resuming)
@@ -211,24 +213,35 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     optimizer = create_optimizer(backbone_frozen)
 
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=rf_model.train_minibatch_size, shuffle=True, num_workers=8
+        dataset, batch_size=minibatch_size, shuffle=True, num_workers=8
     )
     data_iter = iter(dataloader)
 
     run_id = os.path.basename(run_dir)
 
+    if dev:
+        wandb_run: Optional[wandb.wandb_run.Run] = None
+    else:
+        wandb_run: Optional[wandb.wandb_run.Run] = wandb.init(
+            project="rfpix2pix_gen" if getattr(rf_model, 'is_generative', False) else "rfpix2pix",
+            save_code=True,
+            id=run_id,
+            config=rf_model.__config,  # pyright: ignore[reportArgumentType]
+        )
+
     def save(step: int):
         save_module(rf_model, os.path.join(run_dir, f"rfpix2pix_{run_id}_{step:06d}.ckpt"))
 
-    num_grad_acc_steps = max(1, rf_model.train_batch_size // rf_model.train_minibatch_size)
+    num_grad_acc_steps = max(1, batch_size // minibatch_size)
     grad_scale = 1.0 / num_grad_acc_steps
 
     print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Codec ━━━{C.RESET}")
     print(f"{C.BRIGHT_CYAN}  Steps:{C.RESET}          {C.BOLD}{num_steps}{C.RESET}")
-    print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {rf_model.train_minibatch_size}")
+    print(f"{C.BRIGHT_CYAN}  Batch size:{C.RESET}     {batch_size}")
+    print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {minibatch_size}")
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}")
-    print(f"{C.BRIGHT_CYAN}  Losses:{C.RESET}         {', '.join(l.id for l in codec.loss_fns)}")
+    print(f"{C.BRIGHT_CYAN}  Losses:{C.RESET}         {', '.join(l.id for l in codec.loss_fns)}") # type: ignore
     if has_backbone:
         print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}")
     print()
@@ -253,10 +266,13 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
                 data_iter = iter(dataloader)
                 inputs = next(data_iter)
 
-            # Train on both domains: concatenate domain 0 and domain 1
-            x0 = inputs["domain_0"].to(device)
+            # Train on real images only (skip random noise domain)
             x1 = inputs["domain_1"].to(device)
-            x = torch.cat([x0, x1], dim=0)  # (2B, 3, H, W)
+            if dataset.use_random_noise_domain0:
+                x = x1  # Don't train codec on random noise
+            else:
+                x0 = inputs["domain_0"].to(device)
+                x = torch.cat([x0, x1], dim=0)  # (2B, 3, H, W)
 
             output = codec.compute_loss(x)
             loss = output["loss"]
@@ -280,6 +296,12 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
             postfix[k] = f"{v:.4f}"
         progress.set_postfix(postfix)
 
+        if wandb_run is not None:
+            wlog: dict = {"codec_loss": loss_item, "codec_lr": lr, "codec_step": step}
+            for k, v in loss_details.items():
+                wlog[f"codec_{k}"] = v
+            wandb_run.log(wlog)
+
         if step >= next_save_step:
             save(step)
             next_save_step = step + save_steps
@@ -294,6 +316,8 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
                 loss_tracker.reset()
                 save(step)
                 write_codec_state(run_dir, backbone_warmed_up=True)
+                if wandb_run is not None:
+                    wandb_run.log({"codec_backbone_unfrozen": 1, "codec_step": step})
 
     save(last_step)
     write_codec_state(run_dir, trained=True, loss=latest_loss)
@@ -301,6 +325,12 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
 
     # Generate reconstruction grid for visual verification
     sample_codec_reconstruction(rf_model, dataset, run_dir)
+
+    if wandb_run is not None:
+        recon_path = os.path.join(run_dir, "codec_reconstruction.jpg")
+        if os.path.exists(recon_path):
+            wandb_run.log({"codec_reconstruction": wandb.Image(recon_path)})
+        wandb_run.finish()
 
     return latest_loss
 

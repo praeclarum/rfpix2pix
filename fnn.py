@@ -942,13 +942,17 @@ class Codec(nn.Module):
         losses: list[Config] = [],
         learning_rate: float = 1e-4,
         train_images: int = 0,
+        train_batch_size: Optional[int] = None,
+        train_minibatch_size: Optional[int] = None,
         warmup_threshold: Optional[float] = None,
     ):
         super().__init__()
         self.net: CodecNet = object_from_config(net)
-        self.loss_fns = nn.ModuleList([object_from_config(l) for l in losses])
+        self.loss_fns: nn.ModuleList = nn.ModuleList([object_from_config(l) for l in losses])
         self.learning_rate = learning_rate
         self.train_images = train_images
+        self.train_batch_size = train_batch_size
+        self.train_minibatch_size = train_minibatch_size
         self.warmup_threshold = warmup_threshold
 
     @property
