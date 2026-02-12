@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from fnn import *
+
+class Codec(nn.Module):
+    """
+    General codec holder: wraps a CodecNet and a list of losses.
+    
+    The net config determines the actual encoder/decoder architecture.
+    Losses define how the codec is trained (empty = no training needed).
+    Training parameters (learning_rate, train_images, warmup_threshold)
+    control the codec training phase.
+    
+    Properties:
+        out_channels: number of latent channels (for downstream nets)
+        spatial_factor: spatial downsampling factor
+    
+    Example configs:
+        Identity (no-op):
+            {"net": {"type": "IdentityNet"}}
+        
+        VAE:
+            {
+                "net": {"type": "VAE", "latent_channels": 16, "ch_mult": [1,2,4,8]},
+                "losses": [
+                    {"type": "L1Loss", "weight": 1.0},
+                    {"type": "LPIPSLoss", "weight": 1.0},
+                    {"type": "KLLoss", "weight": 1e-6}
+                ],
+                "learning_rate": 1e-4,
+                "train_images": 2000000
+            }
+    """
+    def __init__(
+        self,
+        net: Config = {"type": "IdentityNet"},
+        losses: list[Config] = [],
+        learning_rate: float = 1e-4,
+        train_images: int = 0,
+        train_batch_size: Optional[int] = None,
+        train_minibatch_size: Optional[int] = None,
+        warmup_threshold: Optional[float] = None,
+        sample_batch_size: int = 8,
+        augmentations: list[str] = [],
+    ):
+        super().__init__()
+        self.net: CodecNet = object_from_config(net)
+        self.loss_fns: nn.ModuleList = nn.ModuleList([object_from_config(l) for l in losses])
+        self.learning_rate = learning_rate
+        self.train_images = train_images
+        self.train_batch_size = train_batch_size
+        self.train_minibatch_size = train_minibatch_size
+        self.warmup_threshold = warmup_threshold
+        self.sample_batch_size = sample_batch_size
+        self.augmentations = augmentations
+
+    @property
+    def out_channels(self) -> int:
+        """Number of latent channels — used by velocity_net and saliency_net."""
+        return self.net.latent_channels
+
+    @property
+    def spatial_factor(self) -> int:
+        """Spatial downsampling factor."""
+        return self.net.spatial_factor
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode images to latent space."""
+        return self.net.encode(x)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode latents to pixel space."""
+        return self.net.decode(z)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode then decode (reconstruction)."""
+        return self.net(x)
+
+    def compute_loss(self, x: torch.Tensor) -> dict:
+        """
+        Compute all codec losses on input images.
+        
+        Returns dict with:
+            - "loss": weighted sum of all losses
+            - Each loss's id: individual unweighted loss value
+        """
+        params = self.net.encode_params(x)
+        z = params["z"]
+        x_hat = self.net.decode(z)
+
+        total_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        result: dict = {}
+        for loss_fn in self.loss_fns:
+            if getattr(loss_fn, "kind", "reconstruction") == "regularization":
+                # Regularization loss (e.g., KL): pass distribution params
+                val = loss_fn(params["mu"], params["logvar"])
+            else:
+                # Reconstruction loss (e.g., L1, LPIPS): pass (x_hat, x)
+                val = loss_fn(x_hat, x)
+            result[loss_fn.id] = val.item()
+            total_loss = total_loss + loss_fn.weight * val
+        result["loss"] = total_loss
+        result["x_hat"] = x_hat
+        return result
+
+    def freeze_backbone(self):
+        self.net.freeze_backbone()
+
+    def unfreeze_backbone(self):
+        self.net.unfreeze_backbone()
+
+    def has_backbone(self) -> bool:
+        return self.net.has_backbone()
+
+    def get_optimizer_param_groups(self, lr: float, backbone_frozen: bool) -> list:
+        return self.net.get_optimizer_param_groups(lr, backbone_frozen)
+register_type("Codec", Codec)
+
+

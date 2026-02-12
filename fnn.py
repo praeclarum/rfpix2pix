@@ -105,6 +105,23 @@ def get_activation(activation: str) -> nn.Module:
         return nn.Softmax()
     raise NotImplementedError(f"Unknown activation: {activation}")
 
+def get_downsample(downsample: str, channels: int) -> nn.Module:
+    if downsample == "AvgPool":
+        return nn.AvgPool2d(2)
+    if downsample == "StridedConv":
+        return nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
+    raise NotImplementedError(f"Unknown downsample: {downsample}")
+
+def get_upsample(upsample: str, channels: int) -> nn.Module:
+    if upsample == "Bilinear":
+        return nn.UpsamplingBilinear2d(scale_factor=2)
+    if upsample == "NearestConv":
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+    raise NotImplementedError(f"Unknown upsample: {upsample}")
+
 def zero_module(module: nn.Module, should_zero: bool = True):
     """
     Zero out the parameters of a module and return it.
@@ -240,6 +257,7 @@ class UNet(nn.Module):
         zero_res_blocks: bool = False,
         attention_resolutions: list[int] = [],
         num_attention_heads: int = 8,
+        output_activation: str = "None",
     ):
         super().__init__()
         self.dtype = torch.float32
@@ -306,6 +324,7 @@ class UNet(nn.Module):
             get_normalization(normalization, model_channels),
             get_activation(activation),
             nn.Conv2d(model_channels, output_channels, kernel_size=3, padding=1),
+            get_activation(output_activation),
         )
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
@@ -717,9 +736,13 @@ class Encoder(nn.Module):
     """
     Convolutional encoder: downsamples spatially and projects to a latent space.
 
-    Architecture: Conv -> [ResBlock x N -> AvgPool2d(2)] x levels -> mid ResBlock -> norm -> act -> Conv
+    Architecture: Conv -> [ResBlock x N -> Attn? -> Downsample] x levels -> mid ResBlock(s) + Attn? -> norm -> act -> Conv
 
     spatial_factor = 2 ** (len(ch_mult) - 1)
+
+    Downsample modes:
+        "AvgPool"     — AvgPool2d(2) (default)
+        "StridedConv" — Conv2d 3×3 stride 2
     """
     def __init__(
         self,
@@ -730,6 +753,9 @@ class Encoder(nn.Module):
         normalization: str = "GroupNorm32",
         activation: str = "SiLU",
         num_res_blocks: int = 2,
+        attention_resolutions: list[int] = [],
+        num_attention_heads: int = 8,
+        downsample: str = "AvgPool",
     ):
         super().__init__()
         layers: list[nn.Module] = [nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1)]
@@ -739,11 +765,16 @@ class Encoder(nn.Module):
             layers.append(ResBlock(ch, out_ch, normalization=normalization, activation=activation))
             for _ in range(num_res_blocks - 1):
                 layers.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation))
+            if i in attention_resolutions:
+                layers.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
             if i < len(ch_mult) - 1:
-                layers.append(nn.AvgPool2d(2))
+                layers.append(get_downsample(downsample, out_ch))
             ch = out_ch
         # Mid block
         layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
+        if len(attention_resolutions) > 0:
+            layers.append(SelfAttention2d(ch, num_heads=num_attention_heads, normalization=normalization))
+            layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         # Project to latent
         layers.append(get_normalization(normalization, ch))
         layers.append(get_activation(activation))
@@ -759,9 +790,13 @@ class Decoder(nn.Module):
     """
     Convolutional decoder: upsamples spatially from a latent space.
 
-    Architecture: Conv -> mid ResBlock -> [Upsample(2) -> ResBlock x N] x levels -> norm -> act -> Conv -> Tanh
+    Architecture: Conv -> mid ResBlock(s) + Attn? -> [ResBlock x N -> Attn? -> Upsample] x levels -> norm -> act -> Conv -> output_activation?
 
     spatial_factor = 2 ** (len(ch_mult) - 1)
+
+    Upsample modes:
+        "Bilinear"      — UpsamplingBilinear2d(2×) (default)
+        "NearestConv"   — Nearest-neighbor 2× + Conv2d 3×3
     """
     def __init__(
         self,
@@ -772,26 +807,35 @@ class Decoder(nn.Module):
         normalization: str = "GroupNorm32",
         activation: str = "SiLU",
         num_res_blocks: int = 2,
+        attention_resolutions: list[int] = [],
+        num_attention_heads: int = 8,
+        upsample: str = "Bilinear",
+        output_activation: str = "Tanh",
     ):
         super().__init__()
         ch = model_channels * ch_mult[-1]
         layers: list[nn.Module] = [nn.Conv2d(in_channels, ch, kernel_size=3, padding=1)]
         # Mid block
         layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
+        if len(attention_resolutions) > 0:
+            layers.append(SelfAttention2d(ch, num_heads=num_attention_heads, normalization=normalization))
+            layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         # Upsample levels (reversed)
         for i in reversed(range(len(ch_mult))):
             out_ch = model_channels * ch_mult[i]
             layers.append(ResBlock(ch, out_ch, normalization=normalization, activation=activation))
             for _ in range(num_res_blocks - 1):
                 layers.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation))
+            if i in attention_resolutions:
+                layers.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
             ch = out_ch
             if i > 0:
-                layers.append(nn.UpsamplingBilinear2d(scale_factor=2))
+                layers.append(get_upsample(upsample, ch))
         # To pixel space
         layers.append(get_normalization(normalization, model_channels))
         layers.append(get_activation(activation))
         layers.append(nn.Conv2d(model_channels, out_channels, kernel_size=3, padding=1))
-        layers.append(nn.Tanh())
+        layers.append(get_activation(output_activation))
         self.layers = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -814,6 +858,11 @@ class AutoEncoder(CodecNet):
         normalization: str = "GroupNorm32",
         activation: str = "SiLU",
         num_res_blocks: int = 2,
+        attention_resolutions: list[int] = [],
+        num_attention_heads: int = 8,
+        downsample: str = "AvgPool",
+        upsample: str = "Bilinear",
+        output_activation: str = "Tanh",
     ):
         spatial_factor = 2 ** (len(ch_mult) - 1)
         super().__init__(latent_channels=latent_channels, spatial_factor=spatial_factor)
@@ -825,6 +874,9 @@ class AutoEncoder(CodecNet):
             normalization=normalization,
             activation=activation,
             num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            num_attention_heads=num_attention_heads,
+            downsample=downsample,
         )
         self.decoder = Decoder(
             in_channels=latent_channels,
@@ -834,6 +886,10 @@ class AutoEncoder(CodecNet):
             normalization=normalization,
             activation=activation,
             num_res_blocks=num_res_blocks,
+            attention_resolutions=attention_resolutions,
+            num_attention_heads=num_attention_heads,
+            upsample=upsample,
+            output_activation=output_activation,
         )
 
     def _encoder_out_channels(self, latent_channels: int) -> int:
