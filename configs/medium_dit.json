@@ -1,45 +1,54 @@
 {
     "type": "RFPix2pixModel",
     "max_size": 128,
-    "sample_batch_size": 8,
-    "train_batch_size": 48,
-    "train_minibatch_size": 12,
-    "train_images": 6000000,
-    "learning_rate": 0.0001,
-    "num_inference_steps": 12,
-    "timestep_sampling": "logit-normal",
-    "saliency_learning_rate": 5e-05,
-    "saliency_accuracy_threshold": 0.995,
-    "saliency_warmup_threshold": 0.9,
-    "saliency_blend_fraction": 0.0,
-    "saliency_label_smoothing": 0.1,
-    "saliency_augmentations": [
-        "color_jitter",
-        "grayscale",
-        "hflip",
-        "random_erasing"
-    ],
-    "structure_pairing": false,
-    "structure_candidates": 8,
-    "bf16": true,
-    "velocity_net": {
-        "type": "DiT",
-        "patch_size": 2,
-        "hidden_size": 768,
-        "depth": 12,
-        "num_heads": 12,
-        "mlp_ratio": 4.0
-    },
-    "saliency_net": {
-        "type": "ResNetSaliencyNet",
-        "backbone": "resnet34",
-        "num_classes": 2,
-        "pretrained": true,
-        "latent_channels": 512
-    },
+    "domain0": [],
+    "domain1": [],
     "codec": {
+        "type": "Codec",
         "net": {
             "type": "IdentityNet"
         }
+    },
+    "velocity": {
+        "type": "Velocity",
+        "net": {
+            "type": "DiT",
+            "patch_size": 2,
+            "hidden_size": 768,
+            "depth": 12,
+            "num_heads": 12,
+            "mlp_ratio": 4.0
+        },
+        "sample_batch_size": 8,
+        "train_batch_size": 48,
+        "train_minibatch_size": 12,
+        "train_images": 6000000,
+        "learning_rate": 0.0001,
+        "num_inference_steps": 12,
+        "timestep_sampling": "logit-normal",
+        "structure_pairing": false,
+        "structure_candidates": 8,
+        "bf16": true
+    },
+    "saliency": {
+        "type": "Saliency",
+        "net": {
+            "type": "ResNetSaliencyNet",
+            "backbone": "resnet34",
+            "num_classes": 2,
+            "pretrained": true,
+            "latent_channels": 512
+        },
+        "learning_rate": 5e-05,
+        "accuracy_threshold": 0.995,
+        "warmup_threshold": 0.9,
+        "blend_fraction": 0.0,
+        "label_smoothing": 0.1,
+        "augmentations": [
+            "color_jitter",
+            "grayscale",
+            "hflip",
+            "random_erasing"
+        ]
     }
 }

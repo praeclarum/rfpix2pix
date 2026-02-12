@@ -945,6 +945,8 @@ class Codec(nn.Module):
         train_batch_size: Optional[int] = None,
         train_minibatch_size: Optional[int] = None,
         warmup_threshold: Optional[float] = None,
+        sample_batch_size: int = 8,
+        augmentations: list[str] = [],
     ):
         super().__init__()
         self.net: CodecNet = object_from_config(net)
@@ -954,6 +956,8 @@ class Codec(nn.Module):
         self.train_batch_size = train_batch_size
         self.train_minibatch_size = train_minibatch_size
         self.warmup_threshold = warmup_threshold
+        self.sample_batch_size = sample_batch_size
+        self.augmentations = augmentations
 
     @property
     def out_channels(self) -> int:
@@ -1016,6 +1020,106 @@ class Codec(nn.Module):
     def get_optimizer_param_groups(self, lr: float, backbone_frozen: bool) -> list:
         return self.net.get_optimizer_param_groups(lr, backbone_frozen)
 register_type("Codec", Codec)
+
+
+#
+# VELOCITY
+#
+class Velocity(nn.Module):
+    """
+    Velocity module holder: wraps a velocity network (UNet/DiT) with training
+    and inference parameters.
+    
+    The net config determines the actual velocity prediction architecture.
+    Training parameters control the velocity training phase.
+    
+    Properties:
+        num_downsamples: number of spatial downsampling levels (from net)
+    
+    Example config:
+        {
+            "type": "Velocity",
+            "net": {"type": "UNet", "model_channels": 96, "ch_mult": [1, 2, 4]},
+            "train_batch_size": 48,
+            "train_minibatch_size": 24,
+            "train_images": 6000000,
+            "learning_rate": 0.0002,
+            "num_inference_steps": 12,
+            "timestep_sampling": "logit-normal",
+            "sample_batch_size": 8,
+            "structure_pairing": false,
+            "structure_candidates": 8
+        }
+    """
+    def __init__(
+        self,
+        net: Config,
+        input_channels: int = 3,
+        output_channels: int = 3,
+        train_batch_size: int = 48,
+        train_minibatch_size: int = 48,
+        train_images: int = 6000000,
+        learning_rate: float = 0.0002,
+        num_inference_steps: int = 12,
+        timestep_sampling: str = "logit-normal",
+        sample_batch_size: int = 8,
+        structure_pairing: bool = False,
+        structure_candidates: int = 8,
+        bf16: bool = False,
+    ):
+        super().__init__()
+        self.net = object_from_config(
+            net,
+            input_channels=input_channels,
+            output_channels=output_channels,
+        )
+        self.train_batch_size = train_batch_size
+        self.train_minibatch_size = train_minibatch_size
+        self.train_images = train_images
+        self.learning_rate = learning_rate
+        self.num_inference_steps = num_inference_steps
+        self.timestep_sampling = timestep_sampling
+        self.sample_batch_size = sample_batch_size
+        self.structure_pairing = structure_pairing
+        self.structure_candidates = structure_candidates
+        self.bf16 = bf16
+
+    @property
+    def num_downsamples(self) -> int:
+        return self.net.num_downsamples
+
+    def forward(self, z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Predict velocity at interpolated latent state.
+        
+        Args:
+            z_t: (B, C, H, W) interpolated latent
+            t: (B,) timesteps in [0, 1]
+            
+        Returns:
+            (B, C, H, W) predicted velocity
+        """
+        return self.net(z_t, t)
+
+    def sample_timestep(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Sample flow timesteps based on configured strategy.
+        
+        Args:
+            batch_size: number of timesteps to sample
+            device: torch device
+            dtype: torch dtype
+            
+        Returns:
+            (B,) tensor of timesteps in [0, 1]
+        """
+        if self.timestep_sampling == "uniform":
+            return torch.rand(batch_size, device=device, dtype=dtype)
+        elif self.timestep_sampling == "logit-normal":
+            return torch.sigmoid(torch.randn(batch_size, device=device, dtype=dtype))
+        else:
+            raise ValueError(f"Unknown timestep_sampling: {self.timestep_sampling}")
+register_type("Velocity", Velocity)
 
 
 #
