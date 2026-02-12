@@ -719,7 +719,7 @@ class CodecNet(nn.Module):
         return [{"params": self.parameters(), "lr": lr}]
 
 
-class IdentityNet(CodecNet):
+class Identity(CodecNet):
     """Pass-through: no encoding/decoding. latent_channels=3, spatial_factor=1."""
     def __init__(self):
         super().__init__(latent_channels=3, spatial_factor=1)
@@ -729,7 +729,7 @@ class IdentityNet(CodecNet):
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return z
-register_type("IdentityNet", IdentityNet)
+register_type("Identity", Identity)
 
 
 class Encoder(nn.Module):
@@ -754,6 +754,7 @@ class Encoder(nn.Module):
         activation: str = "SiLU",
         num_res_blocks: int = 2,
         attention_resolutions: list[int] = [],
+        mid_attention: bool = False,
         num_attention_heads: int = 8,
         downsample: str = "AvgPool",
     ):
@@ -772,7 +773,7 @@ class Encoder(nn.Module):
             ch = out_ch
         # Mid block
         layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
-        if len(attention_resolutions) > 0:
+        if mid_attention:
             layers.append(SelfAttention2d(ch, num_heads=num_attention_heads, normalization=normalization))
             layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         # Project to latent
@@ -795,8 +796,8 @@ class Decoder(nn.Module):
     spatial_factor = 2 ** (len(ch_mult) - 1)
 
     Upsample modes:
-        "Bilinear"      — UpsamplingBilinear2d(2×) (default)
-        "NearestConv"   — Nearest-neighbor 2× + Conv2d 3×3
+        "Bilinear"      — UpsamplingBilinear2d(2x) (default)
+        "NearestConv"   — Nearest-neighbor 2x + Conv2d 3x3
     """
     def __init__(
         self,
@@ -808,6 +809,7 @@ class Decoder(nn.Module):
         activation: str = "SiLU",
         num_res_blocks: int = 2,
         attention_resolutions: list[int] = [],
+        mid_attention: bool = False,
         num_attention_heads: int = 8,
         upsample: str = "Bilinear",
         output_activation: str = "Tanh",
@@ -817,7 +819,7 @@ class Decoder(nn.Module):
         layers: list[nn.Module] = [nn.Conv2d(in_channels, ch, kernel_size=3, padding=1)]
         # Mid block
         layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
-        if len(attention_resolutions) > 0:
+        if mid_attention:
             layers.append(SelfAttention2d(ch, num_heads=num_attention_heads, normalization=normalization))
             layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         # Upsample levels (reversed)
@@ -858,7 +860,9 @@ class AutoEncoder(CodecNet):
         normalization: str = "GroupNorm32",
         activation: str = "SiLU",
         num_res_blocks: int = 2,
+        decoder_num_res_blocks: Optional[int] = None,
         attention_resolutions: list[int] = [],
+        mid_attention: bool = False,
         num_attention_heads: int = 8,
         downsample: str = "AvgPool",
         upsample: str = "Bilinear",
@@ -875,6 +879,7 @@ class AutoEncoder(CodecNet):
             activation=activation,
             num_res_blocks=num_res_blocks,
             attention_resolutions=attention_resolutions,
+            mid_attention=mid_attention,
             num_attention_heads=num_attention_heads,
             downsample=downsample,
         )
@@ -885,8 +890,9 @@ class AutoEncoder(CodecNet):
             ch_mult=ch_mult,
             normalization=normalization,
             activation=activation,
-            num_res_blocks=num_res_blocks,
+            num_res_blocks=decoder_num_res_blocks if decoder_num_res_blocks is not None else num_res_blocks,
             attention_resolutions=attention_resolutions,
+            mid_attention=mid_attention,
             num_attention_heads=num_attention_heads,
             upsample=upsample,
             output_activation=output_activation,

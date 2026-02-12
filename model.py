@@ -22,7 +22,7 @@ class RFPix2pixModel(nn.Module):
     def __init__(
         self,
         max_size: int,
-        codec: Config = {"type": "Codec", "net": {"type": "IdentityNet"}},
+        codec: Config = {"type": "Codec", "net": {"type": "Identity"}},
         velocity: Config = {"type": "Velocity", "net": {"type": "UNet", "model_channels": 64, "ch_mult": [1, 2, 4]}},
         saliency: Config = {"type": "Saliency", "net": {"type": "ResNetSaliencyNet"}},
         domain0: list = [],

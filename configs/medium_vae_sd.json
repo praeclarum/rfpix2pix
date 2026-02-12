@@ -6,8 +6,50 @@
     "codec": {
         "type": "Codec",
         "net": {
-            "type": "Identity"
-        }
+            "type": "VAE",
+            "latent_channels": 8,
+            "model_channels": 64,
+            "ch_mult": [
+                1,
+                2,
+                4,
+                4
+            ],
+            "normalization": "GroupNorm32",
+            "activation": "SiLU",
+            "num_res_blocks": 2,
+            "decoder_num_res_blocks": 3,
+            "mid_attention": true,
+            "num_attention_heads": 1,
+            "downsample": "StridedConv",
+            "upsample": "NearestConv",
+            "output_activation": "Tanh"
+        },
+        "losses": [
+            {
+                "type": "L1Loss",
+                "id": "recon_loss",
+                "weight": 1.0
+            },
+            {
+                "type": "LPIPSLoss",
+                "id": "lpips_loss",
+                "weight": 1.0
+            },
+            {
+                "type": "KLLoss",
+                "id": "kl_loss",
+                "weight": 1e-03
+            }
+        ],
+        "learning_rate": 0.0001,
+        "train_batch_size": 48,
+        "train_minibatch_size": 24,
+        "train_images": 2000000,
+        "sample_batch_size": 8,
+        "augmentations": [
+            "hflip"
+        ]
     },
     "velocity": {
         "type": "Velocity",
@@ -17,21 +59,16 @@
             "ch_mult": [
                 1,
                 2,
-                4,
-                8
+                4
             ],
             "normalization": "GroupNorm32",
             "activation": "SiLU",
             "num_res_blocks": 2,
-            "zero_res_blocks": false,
-            "attention_resolutions": [
-                3
-            ],
-            "num_attention_heads": 8
+            "zero_res_blocks": false
         },
         "sample_batch_size": 8,
         "train_batch_size": 48,
-        "train_minibatch_size": 48,
+        "train_minibatch_size": 24,
         "train_images": 6000000,
         "learning_rate": 0.0002,
         "num_inference_steps": 12,

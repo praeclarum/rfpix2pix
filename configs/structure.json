@@ -6,7 +6,7 @@
     "codec": {
         "type": "Codec",
         "net": {
-            "type": "IdentityNet"
+            "type": "Identity"
         }
     },
     "velocity": {

@@ -19,7 +19,7 @@ class Codec(nn.Module):
     
     Example configs:
         Identity (no-op):
-            {"net": {"type": "IdentityNet"}}
+            {"net": {"type": "Identity"}}
         
         VAE:
             {
@@ -35,7 +35,7 @@ class Codec(nn.Module):
     """
     def __init__(
         self,
-        net: Config = {"type": "IdentityNet"},
+        net: Config = {"type": "Identity"},
         losses: list[Config] = [],
         learning_rate: float = 1e-4,
         train_images: int = 0,
