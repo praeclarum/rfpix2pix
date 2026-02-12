@@ -114,10 +114,15 @@ python train.py --config configs/small.json \
 
 ```
 rfpix2pix/
+├── codec.py          # Codec network to convert between pixel and latent space
 ├── data.py           # Dataset for loading unpaired image/video domains
 ├── fnn.py            # Neural network utilities and config system
-├── model.py          # RFPix2pixModel with saliency and velocity networks
+├── model.py          # RFPix2pixModel and Velocity networks
+├── saliency.py       # Saliency network and related losses
 ├── split.py          # Automatic domain0/domain1 splitting from uncategorized images
+├── train_codec.py    # Script for training just the codec
+├── train_velocity.py # Script for training just the velocity network
+├── train_saliency.py # Script for training just the saliency network
 ├── train.py          # Training script and CLI
 ├── utils.py          # Junk drawer
 └── configs/          # Example configurations

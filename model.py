@@ -3,6 +3,7 @@ from typing import Optional
 import torch
 
 from fnn import *
+from codec import Codec
 from saliency import Saliency
 
 class RFPix2pixModel(nn.Module):

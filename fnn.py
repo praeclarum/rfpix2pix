@@ -225,7 +225,7 @@ class SelfAttention2d(nn.Module):
 
 
 #
-# MODEL
+# UNet
 #
 class UNet(nn.Module):
     def __init__(
@@ -641,29 +641,6 @@ register_type("DiT", DiT)
 
 
 #
-# LOSS
-#
-class L1Loss(nn.Module):
-    def __init__(self, id: str="l1_loss", weight: float=1.0):
-        super().__init__()
-        self.id = id
-        self.weight = weight
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return F.l1_loss(input, target)
-register_type("L1Loss", L1Loss)
-
-
-class MSELoss(nn.Module):
-    def __init__(self, id: str="mse_loss", weight: float=1.0):
-        super().__init__()
-        self.id = id
-        self.weight = weight
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return F.mse_loss(input, target)
-register_type("MSELoss", MSELoss)
-
-
-#
 # CODEC NETS
 #
 class CodecNet(nn.Module):
@@ -736,16 +713,98 @@ class IdentityNet(CodecNet):
 register_type("IdentityNet", IdentityNet)
 
 
-class ConvEncoderDecoder(CodecNet):
+class Encoder(nn.Module):
     """
-    Convolutional VAE encoder-decoder (UNet-like without skip connections).
-    
-    Encoder: Conv -> [ResBlock x N -> AvgPool2d(2)] x levels -> mid ResBlock -> Conv -> (mu, logvar)
-    Decoder: Conv -> mid ResBlock -> [Upsample(2) -> ResBlock x N] x levels -> Conv -> Tanh
-    
+    Convolutional encoder: downsamples spatially and projects to a latent space.
+
+    Architecture: Conv -> [ResBlock x N -> AvgPool2d(2)] x levels -> mid ResBlock -> norm -> act -> Conv
+
     spatial_factor = 2 ** (len(ch_mult) - 1)
-    e.g. ch_mult=[1,2,4] -> 2 downsamples -> 4x spatial reduction
-         ch_mult=[1,2,4,8] -> 3 downsamples -> 8x spatial reduction
+    """
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 16,
+        model_channels: int = 64,
+        ch_mult: list[int] = [1, 2, 4],
+        normalization: str = "GroupNorm32",
+        activation: str = "SiLU",
+        num_res_blocks: int = 2,
+    ):
+        super().__init__()
+        layers: list[nn.Module] = [nn.Conv2d(in_channels, model_channels, kernel_size=3, padding=1)]
+        ch = model_channels
+        for i, m in enumerate(ch_mult):
+            out_ch = model_channels * m
+            layers.append(ResBlock(ch, out_ch, normalization=normalization, activation=activation))
+            for _ in range(num_res_blocks - 1):
+                layers.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation))
+            if i < len(ch_mult) - 1:
+                layers.append(nn.AvgPool2d(2))
+            ch = out_ch
+        # Mid block
+        layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
+        # Project to latent
+        layers.append(get_normalization(normalization, ch))
+        layers.append(get_activation(activation))
+        layers.append(nn.Conv2d(ch, out_channels, kernel_size=3, padding=1))
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+register_type("Encoder", Encoder)
+
+
+class Decoder(nn.Module):
+    """
+    Convolutional decoder: upsamples spatially from a latent space.
+
+    Architecture: Conv -> mid ResBlock -> [Upsample(2) -> ResBlock x N] x levels -> norm -> act -> Conv -> Tanh
+
+    spatial_factor = 2 ** (len(ch_mult) - 1)
+    """
+    def __init__(
+        self,
+        in_channels: int = 16,
+        out_channels: int = 3,
+        model_channels: int = 64,
+        ch_mult: list[int] = [1, 2, 4],
+        normalization: str = "GroupNorm32",
+        activation: str = "SiLU",
+        num_res_blocks: int = 2,
+    ):
+        super().__init__()
+        ch = model_channels * ch_mult[-1]
+        layers: list[nn.Module] = [nn.Conv2d(in_channels, ch, kernel_size=3, padding=1)]
+        # Mid block
+        layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
+        # Upsample levels (reversed)
+        for i in reversed(range(len(ch_mult))):
+            out_ch = model_channels * ch_mult[i]
+            layers.append(ResBlock(ch, out_ch, normalization=normalization, activation=activation))
+            for _ in range(num_res_blocks - 1):
+                layers.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation))
+            ch = out_ch
+            if i > 0:
+                layers.append(nn.UpsamplingBilinear2d(scale_factor=2))
+        # To pixel space
+        layers.append(get_normalization(normalization, model_channels))
+        layers.append(get_activation(activation))
+        layers.append(nn.Conv2d(model_channels, out_channels, kernel_size=3, padding=1))
+        layers.append(nn.Tanh())
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.layers(z)
+register_type("Decoder", Decoder)
+
+
+class AutoEncoder(CodecNet):
+    """
+    Deterministic convolutional autoencoder.
+
+    Composes an Encoder and Decoder without any stochastic sampling.
+    spatial_factor = 2 ** (len(ch_mult) - 1)
     """
     def __init__(
         self,
@@ -758,47 +817,47 @@ class ConvEncoderDecoder(CodecNet):
     ):
         spatial_factor = 2 ** (len(ch_mult) - 1)
         super().__init__(latent_channels=latent_channels, spatial_factor=spatial_factor)
+        self.encoder = Encoder(
+            in_channels=3,
+            out_channels=self._encoder_out_channels(latent_channels),
+            model_channels=model_channels,
+            ch_mult=ch_mult,
+            normalization=normalization,
+            activation=activation,
+            num_res_blocks=num_res_blocks,
+        )
+        self.decoder = Decoder(
+            in_channels=latent_channels,
+            out_channels=3,
+            model_channels=model_channels,
+            ch_mult=ch_mult,
+            normalization=normalization,
+            activation=activation,
+            num_res_blocks=num_res_blocks,
+        )
 
-        def make_res_blocks(in_ch: int, out_ch: int) -> nn.Sequential:
-            blocks = [ResBlock(in_ch, out_ch, normalization=normalization, activation=activation)]
-            for _ in range(num_res_blocks - 1):
-                blocks.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation))
-            return nn.Sequential(*blocks)
+    def _encoder_out_channels(self, latent_channels: int) -> int:
+        """Number of channels the encoder should produce. Overridden by VAE."""
+        return latent_channels
 
-        # --- Encoder ---
-        enc_layers: list[nn.Module] = [nn.Conv2d(3, model_channels, kernel_size=3, padding=1)]
-        ch = model_channels
-        for i, m in enumerate(ch_mult):
-            out_ch = model_channels * m
-            enc_layers.append(make_res_blocks(ch, out_ch))
-            if i < len(ch_mult) - 1:
-                enc_layers.append(nn.AvgPool2d(2))
-            ch = out_ch
-        # Mid block
-        enc_layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
-        # To latent params (mu, logvar)
-        enc_layers.append(get_normalization(normalization, ch))
-        enc_layers.append(get_activation(activation))
-        enc_layers.append(nn.Conv2d(ch, 2 * latent_channels, kernel_size=3, padding=1))
-        self.encoder = nn.Sequential(*enc_layers)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(x)
 
-        # --- Decoder ---
-        dec_layers: list[nn.Module] = [nn.Conv2d(latent_channels, ch, kernel_size=3, padding=1)]
-        # Mid block
-        dec_layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
-        # Upsample levels (reversed)
-        for i in reversed(range(len(ch_mult))):
-            out_ch = model_channels * ch_mult[i]
-            dec_layers.append(make_res_blocks(ch, out_ch))
-            ch = out_ch
-            if i > 0:
-                dec_layers.append(nn.UpsamplingBilinear2d(scale_factor=2))
-        # To pixel space
-        dec_layers.append(get_normalization(normalization, model_channels))
-        dec_layers.append(get_activation(activation))
-        dec_layers.append(nn.Conv2d(model_channels, 3, kernel_size=3, padding=1))
-        dec_layers.append(nn.Tanh())
-        self.decoder = nn.Sequential(*dec_layers)
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
+register_type("AutoEncoder", AutoEncoder)
+
+
+class VAE(AutoEncoder):
+    """
+    Variational autoencoder.
+
+    Inherits from AutoEncoder but doubles the encoder output channels to
+    produce (mu, logvar) and applies the reparameterization trick.
+    """
+
+    def _encoder_out_channels(self, latent_channels: int) -> int:
+        return 2 * latent_channels
 
     def encode_params(self, x: torch.Tensor) -> dict:
         """Encode and return mu, logvar, and reparameterized sample z."""
@@ -815,311 +874,7 @@ class ConvEncoderDecoder(CodecNet):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode_params(x)["z"]
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z)
-register_type("ConvEncoderDecoder", ConvEncoderDecoder)
-
-
-#
-# CODEC LOSSES
-#
-class KLLoss(nn.Module):
-    """
-    KL divergence loss for VAE: -0.5 * mean(1 + logvar - mu^2 - exp(logvar)).
-    
-    This is a regularization loss — it takes (mu, logvar) not (input, target).
-    """
-    kind = "regularization"
-    def __init__(self, id: str = "kl_loss", weight: float = 1e-6):
-        super().__init__()
-        self.id = id
-        self.weight = weight
-    def forward(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        return -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
-register_type("KLLoss", KLLoss)
-
-
-class LPIPSLoss(nn.Module):
-    """
-    Learned Perceptual Image Patch Similarity using VGG16 features.
-    
-    Computes L1 distance between feature maps at multiple layers.
-    Input is expected in [-1, 1] range (converted to [0, 1] internally).
-    The VGG backbone is always frozen.
-    """
-    kind = "reconstruction"
-    def __init__(self, id: str = "lpips_loss", weight: float = 1.0):
-        super().__init__()
-        self.id = id
-        self.weight = weight
-        self._vgg: Optional[nn.Module] = None
-        self._feature_layers: list[str] = []
-        # Lazily initialized to avoid loading VGG at config parse time
-
-    def _ensure_vgg(self, device: torch.device):
-        if self._vgg is not None:
-            return
-        from torchvision.models import vgg16, VGG16_Weights
-        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features.to(device)
-        vgg.eval()
-        for p in vgg.parameters():
-            p.requires_grad = False
-        self._vgg = vgg
-        # Feature extraction points (after ReLU):
-        # relu1_2 = layer 3, relu2_2 = layer 8, relu3_3 = layer 15, relu4_3 = layer 22
-        self._feature_indices = [3, 8, 15, 22]
-
-    def _extract_features(self, x: torch.Tensor) -> list[torch.Tensor]:
-        """Extract multi-scale VGG features from images in [0, 1]."""
-        features = []
-        h = x
-        for i, layer in enumerate(self._vgg):  # type: ignore
-            h = layer(h)
-            if i in self._feature_indices:
-                features.append(h)
-            if i >= self._feature_indices[-1]:
-                break
-        return features
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute perceptual loss.
-        
-        Args:
-            input: (B, 3, H, W) reconstructed images in [-1, 1]
-            target: (B, 3, H, W) original images in [-1, 1]
-        """
-        self._ensure_vgg(input.device)
-        # Convert [-1, 1] -> [0, 1]
-        inp_01 = (input + 1.0) * 0.5
-        tgt_01 = (target + 1.0) * 0.5
-        # Extract features and compute L1 distance per layer
-        feats_inp = self._extract_features(inp_01)
-        feats_tgt = self._extract_features(tgt_01)
-        loss = torch.tensor(0.0, device=input.device, dtype=input.dtype)
-        for fi, ft in zip(feats_inp, feats_tgt):
-            loss = loss + F.l1_loss(fi, ft)
-        return loss
-register_type("LPIPSLoss", LPIPSLoss)
-
-
-#
-# CODEC
-#
-class Codec(nn.Module):
-    """
-    General codec holder: wraps a CodecNet and a list of losses.
-    
-    The net config determines the actual encoder/decoder architecture.
-    Losses define how the codec is trained (empty = no training needed).
-    Training parameters (learning_rate, train_images, warmup_threshold)
-    control the codec training phase.
-    
-    Properties:
-        out_channels: number of latent channels (for downstream nets)
-        spatial_factor: spatial downsampling factor
-    
-    Example configs:
-        Identity (no-op):
-            {"net": {"type": "IdentityNet"}}
-        
-        VAE:
-            {
-                "net": {"type": "ConvEncoderDecoder", "latent_channels": 16, "ch_mult": [1,2,4,8]},
-                "losses": [
-                    {"type": "L1Loss", "weight": 1.0},
-                    {"type": "LPIPSLoss", "weight": 1.0},
-                    {"type": "KLLoss", "weight": 1e-6}
-                ],
-                "learning_rate": 1e-4,
-                "train_images": 2000000
-            }
-    """
-    def __init__(
-        self,
-        net: Config = {"type": "IdentityNet"},
-        losses: list[Config] = [],
-        learning_rate: float = 1e-4,
-        train_images: int = 0,
-        train_batch_size: Optional[int] = None,
-        train_minibatch_size: Optional[int] = None,
-        warmup_threshold: Optional[float] = None,
-        sample_batch_size: int = 8,
-        augmentations: list[str] = [],
-    ):
-        super().__init__()
-        self.net: CodecNet = object_from_config(net)
-        self.loss_fns: nn.ModuleList = nn.ModuleList([object_from_config(l) for l in losses])
-        self.learning_rate = learning_rate
-        self.train_images = train_images
-        self.train_batch_size = train_batch_size
-        self.train_minibatch_size = train_minibatch_size
-        self.warmup_threshold = warmup_threshold
-        self.sample_batch_size = sample_batch_size
-        self.augmentations = augmentations
-
-    @property
-    def out_channels(self) -> int:
-        """Number of latent channels — used by velocity_net and saliency_net."""
-        return self.net.latent_channels
-
-    @property
-    def spatial_factor(self) -> int:
-        """Spatial downsampling factor."""
-        return self.net.spatial_factor
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode images to latent space."""
-        return self.net.encode(x)
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """Decode latents to pixel space."""
-        return self.net.decode(z)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode then decode (reconstruction)."""
-        return self.net(x)
-
-    def compute_loss(self, x: torch.Tensor) -> dict:
-        """
-        Compute all codec losses on input images.
-        
-        Returns dict with:
-            - "loss": weighted sum of all losses
-            - Each loss's id: individual unweighted loss value
-        """
-        params = self.net.encode_params(x)
-        z = params["z"]
-        x_hat = self.net.decode(z)
-
-        total_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        result: dict = {}
-        for loss_fn in self.loss_fns:
-            if getattr(loss_fn, "kind", "reconstruction") == "regularization":
-                # Regularization loss (e.g., KL): pass distribution params
-                val = loss_fn(params["mu"], params["logvar"])
-            else:
-                # Reconstruction loss (e.g., L1, LPIPS): pass (x_hat, x)
-                val = loss_fn(x_hat, x)
-            result[loss_fn.id] = val.item()
-            total_loss = total_loss + loss_fn.weight * val
-        result["loss"] = total_loss
-        result["x_hat"] = x_hat
-        return result
-
-    def freeze_backbone(self):
-        self.net.freeze_backbone()
-
-    def unfreeze_backbone(self):
-        self.net.unfreeze_backbone()
-
-    def has_backbone(self) -> bool:
-        return self.net.has_backbone()
-
-    def get_optimizer_param_groups(self, lr: float, backbone_frozen: bool) -> list:
-        return self.net.get_optimizer_param_groups(lr, backbone_frozen)
-register_type("Codec", Codec)
-
-
-#
-# VELOCITY
-#
-class Velocity(nn.Module):
-    """
-    Velocity module holder: wraps a velocity network (UNet/DiT) with training
-    and inference parameters.
-    
-    The net config determines the actual velocity prediction architecture.
-    Training parameters control the velocity training phase.
-    
-    Properties:
-        num_downsamples: number of spatial downsampling levels (from net)
-    
-    Example config:
-        {
-            "type": "Velocity",
-            "net": {"type": "UNet", "model_channels": 96, "ch_mult": [1, 2, 4]},
-            "train_batch_size": 48,
-            "train_minibatch_size": 24,
-            "train_images": 6000000,
-            "learning_rate": 0.0002,
-            "num_inference_steps": 12,
-            "timestep_sampling": "logit-normal",
-            "sample_batch_size": 8,
-            "structure_pairing": false,
-            "structure_candidates": 8
-        }
-    """
-    def __init__(
-        self,
-        net: Config,
-        input_channels: int = 3,
-        output_channels: int = 3,
-        train_batch_size: int = 48,
-        train_minibatch_size: int = 48,
-        train_images: int = 6000000,
-        learning_rate: float = 0.0002,
-        num_inference_steps: int = 12,
-        timestep_sampling: str = "logit-normal",
-        sample_batch_size: int = 8,
-        structure_pairing: bool = False,
-        structure_candidates: int = 8,
-        bf16: bool = False,
-    ):
-        super().__init__()
-        self.net = object_from_config(
-            net,
-            input_channels=input_channels,
-            output_channels=output_channels,
-        )
-        self.train_batch_size = train_batch_size
-        self.train_minibatch_size = train_minibatch_size
-        self.train_images = train_images
-        self.learning_rate = learning_rate
-        self.num_inference_steps = num_inference_steps
-        self.timestep_sampling = timestep_sampling
-        self.sample_batch_size = sample_batch_size
-        self.structure_pairing = structure_pairing
-        self.structure_candidates = structure_candidates
-        self.bf16 = bf16
-
-    @property
-    def num_downsamples(self) -> int:
-        return self.net.num_downsamples
-
-    def forward(self, z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Predict velocity at interpolated latent state.
-        
-        Args:
-            z_t: (B, C, H, W) interpolated latent
-            t: (B,) timesteps in [0, 1]
-            
-        Returns:
-            (B, C, H, W) predicted velocity
-        """
-        return self.net(z_t, t)
-
-    def sample_timestep(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """
-        Sample flow timesteps based on configured strategy.
-        
-        Args:
-            batch_size: number of timesteps to sample
-            device: torch device
-            dtype: torch dtype
-            
-        Returns:
-            (B,) tensor of timesteps in [0, 1]
-        """
-        if self.timestep_sampling == "uniform":
-            return torch.rand(batch_size, device=device, dtype=dtype)
-        elif self.timestep_sampling == "logit-normal":
-            return torch.sigmoid(torch.randn(batch_size, device=device, dtype=dtype))
-        else:
-            raise ValueError(f"Unknown timestep_sampling: {self.timestep_sampling}")
-register_type("Velocity", Velocity)
+register_type("VAE", VAE)
 
 
 #
@@ -1321,3 +1076,106 @@ class UNet3D(nn.Module):
         y = self.output_block(h)
         return y
 register_type("UNet3D", UNet3D)
+
+
+#
+# LOSS
+#
+class L1Loss(nn.Module):
+    def __init__(self, id: str="l1_loss", weight: float=1.0):
+        super().__init__()
+        self.id = id
+        self.weight = weight
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.l1_loss(input, target)
+register_type("L1Loss", L1Loss)
+
+
+class MSELoss(nn.Module):
+    def __init__(self, id: str="mse_loss", weight: float=1.0):
+        super().__init__()
+        self.id = id
+        self.weight = weight
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(input, target)
+register_type("MSELoss", MSELoss)
+
+
+class KLLoss(nn.Module):
+    """
+    KL divergence loss for VAE: -0.5 * mean(1 + logvar - mu^2 - exp(logvar)).
+    
+    This is a regularization loss — it takes (mu, logvar) not (input, target).
+    """
+    kind = "regularization"
+    def __init__(self, id: str = "kl_loss", weight: float = 1e-6):
+        super().__init__()
+        self.id = id
+        self.weight = weight
+    def forward(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        return -0.5 * torch.mean(1.0 + logvar - mu.pow(2) - logvar.exp())
+register_type("KLLoss", KLLoss)
+
+
+class LPIPSLoss(nn.Module):
+    """
+    Learned Perceptual Image Patch Similarity using VGG16 features.
+    
+    Computes L1 distance between feature maps at multiple layers.
+    Input is expected in [-1, 1] range (converted to [0, 1] internally).
+    The VGG backbone is always frozen.
+    """
+    kind = "reconstruction"
+    def __init__(self, id: str = "lpips_loss", weight: float = 1.0):
+        super().__init__()
+        self.id = id
+        self.weight = weight
+        self._vgg: Optional[nn.Module] = None
+        self._feature_layers: list[str] = []
+        # Lazily initialized to avoid loading VGG at config parse time
+
+    def _ensure_vgg(self, device: torch.device):
+        if self._vgg is not None:
+            return
+        from torchvision.models import vgg16, VGG16_Weights
+        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features.to(device)
+        vgg.eval()
+        for p in vgg.parameters():
+            p.requires_grad = False
+        self._vgg = vgg
+        # Feature extraction points (after ReLU):
+        # relu1_2 = layer 3, relu2_2 = layer 8, relu3_3 = layer 15, relu4_3 = layer 22
+        self._feature_indices = [3, 8, 15, 22]
+
+    def _extract_features(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Extract multi-scale VGG features from images in [0, 1]."""
+        features = []
+        h = x
+        for i, layer in enumerate(self._vgg):  # type: ignore
+            h = layer(h)
+            if i in self._feature_indices:
+                features.append(h)
+            if i >= self._feature_indices[-1]:
+                break
+        return features
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Compute perceptual loss.
+        
+        Args:
+            input: (B, 3, H, W) reconstructed images in [-1, 1]
+            target: (B, 3, H, W) original images in [-1, 1]
+        """
+        self._ensure_vgg(input.device)
+        # Convert [-1, 1] -> [0, 1]
+        inp_01 = (input + 1.0) * 0.5
+        tgt_01 = (target + 1.0) * 0.5
+        # Extract features and compute L1 distance per layer
+        feats_inp = self._extract_features(inp_01)
+        feats_tgt = self._extract_features(tgt_01)
+        loss = torch.tensor(0.0, device=input.device, dtype=input.dtype)
+        for fi, ft in zip(feats_inp, feats_tgt):
+            loss = loss + F.l1_loss(fi, ft)
+        return loss
+register_type("LPIPSLoss", LPIPSLoss)
