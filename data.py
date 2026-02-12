@@ -300,24 +300,21 @@ def get_default_video_sampler() -> VideoFrameSampler:
 
 def preprocess_pil_image(image: Image.Image, max_size: int) -> torch.Tensor:
     src_width, src_height = image.size
-    prescale = 0.9 + 0.1 * random.random()
-    if src_width >= src_height:
-        haspect = min(4 / 3, src_width / src_height)
-        crop_height = int(src_height * prescale)
-        crop_width = int(crop_height * haspect)
-        if crop_width > src_width:
-            crop_width = src_width
-            crop_height = int(crop_width / haspect)
-    else:
-        vaspect = min(4 / 3, src_height / src_width)
-        crop_width = int(src_width * prescale)
-        crop_height = int(crop_width * vaspect)
-        if crop_height > src_height:
-            crop_height = src_height
-            crop_width = int(crop_height / vaspect)
-    crop_x = (src_width - crop_width) // 2
-    crop_y = (src_height - crop_height) // 2
-    image = image.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
+    short_side = min(src_width, src_height)
+
+    # Scale jitter: randomly zoom in up to 10%
+    crop_size = max(int(short_side * (0.9 + 0.1 * random.random())), 1)
+
+    # Position jitter: offset crop center by up to ±5% of short side
+    max_jitter = int(short_side * 0.05)
+    cx = src_width // 2 + (random.randint(-max_jitter, max_jitter) if max_jitter > 0 else 0)
+    cy = src_height // 2 + (random.randint(-max_jitter, max_jitter) if max_jitter > 0 else 0)
+
+    # Compute crop origin, clamped to stay within image bounds
+    x0 = min(max(cx - crop_size // 2, 0), src_width - crop_size)
+    y0 = min(max(cy - crop_size // 2, 0), src_height - crop_size)
+
+    image = image.crop((x0, y0, x0 + crop_size, y0 + crop_size))
     image = image.resize((max_size, max_size), Image.LANCZOS)
     image_array = np.array(image).astype(np.float32) / 127.5 - 1.0
     image_array = np.transpose(image_array, (2, 0, 1))
