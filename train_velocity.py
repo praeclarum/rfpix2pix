@@ -55,8 +55,13 @@ def compute_velocity_loss(
     
     # Encode to latent space (codec is frozen)
     with torch.no_grad():
-        z0 = codec.encode(x0)  # (B, C, H', W')
         z1 = codec.encode(x1)  # (B, C, H', W')
+        if is_generative:
+            # Generative mode: draw z0 directly in latent space (standard normal)
+            # Do NOT encode pixel-space noise through the codec
+            z0 = torch.randn_like(z1)
+        else:
+            z0 = codec.encode(x0)  # (B, C, H', W')
 
     # Reshape t for broadcasting: (B,) -> (B, 1, 1, 1)
     t_broadcast = t[:, None, None, None] # type: ignore
@@ -106,12 +111,26 @@ def compute_velocity_loss(
 def sample(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, name: str):
     """Generate sample grid showing [input | output] pairs."""
     rows = []
+    is_generative = dataset.use_random_noise_domain0
     num_samples = rf_model.velocity.sample_batch_size
+    sf = rf_model.codec.spatial_factor
+    latent_ch = rf_model.codec.out_channels
+    h = dataset.max_image_size // sf
+    w = h
     for i in range(num_samples):
-        inputs = dataset[random.randint(0, len(dataset) - 1)]
-        input_image = inputs["domain_0"].unsqueeze(0).to(device)  # (1, 3, H, W)
-        output_image = rf_model.generate(input_image)
-        row = torch.cat([input_image, output_image], dim=3)  # (1, 3, H, 2W)
+        if is_generative:
+            z0 = torch.randn(1, latent_ch, h, w, device=device)
+        else:
+            inputs = dataset[random.randint(0, len(dataset) - 1)]
+            input_image = inputs["domain_0"].unsqueeze(0).to(device)  # (1, 3, H, W)
+            z0 = rf_model.codec.encode(input_image)
+        output_image = rf_model.generate(z0)
+        # Show z0 input (first 3 channels) alongside output
+        input_vis = z0[:, :3, :, :]
+        # Upsample input_vis to match output spatial size
+        if input_vis.shape[2:] != output_image.shape[2:]:
+            input_vis = torch.nn.functional.interpolate(input_vis, size=output_image.shape[2:], mode='nearest')
+        row = torch.cat([input_vis, output_image], dim=3)  # (1, 3, H, 2W)
         rows.append(row)
     image = torch.cat(rows, dim=2)  # (1, 3, H*B, 2W)
     image = (image.squeeze(0).cpu().numpy() + 1.0) * 127.5

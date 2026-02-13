@@ -68,8 +68,8 @@
             "zero_res_blocks": false
         },
         "sample_batch_size": 8,
-        "train_batch_size": 48,
-        "train_minibatch_size": 24,
+        "train_batch_size": 64,
+        "train_minibatch_size": 64,
         "train_images": 6000000,
         "learning_rate": 0.0002,
         "num_inference_steps": 12,

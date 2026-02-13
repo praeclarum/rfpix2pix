@@ -79,16 +79,14 @@ class RFPix2pixModel(nn.Module):
     @torch.no_grad()
     def generate(
         self,
-        x0: torch.Tensor,
+        z0: torch.Tensor,
         num_steps: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Generate image from a single input image.
-        
-        Encodes to latent space, integrates velocity ODE, decodes back to pixels.
+        Generate image by integrating the velocity ODE and decoding.
         
         Args:
-            x0: (B, 3, H, W) input image (pixel space)
+            z0: (B, C, H', W') starting latent
             num_steps: number of flow integration steps (default: velocity.num_inference_steps)
             
         Returns:
@@ -97,8 +95,7 @@ class RFPix2pixModel(nn.Module):
         if num_steps is None:
             num_steps = self.velocity.num_inference_steps
 
-        # Encode to latent space
-        z = self.codec.encode(x0)  # (B, C, H', W')
+        z = z0
         B = z.shape[0]
 
         # Euler integration in latent space
