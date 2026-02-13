@@ -17,7 +17,13 @@
             ],
             "normalization": "GroupNorm32",
             "activation": "SiLU",
-            "num_res_blocks": 2
+            "num_res_blocks": 2,
+            "decoder_num_res_blocks": 2,
+            "mid_attention": false,
+            "num_attention_heads": 1,
+            "downsample": "AvgPool",
+            "upsample": "Bilinear",
+            "output_activation": "Tanh"
         },
         "losses": [
             {
