@@ -60,11 +60,19 @@ def save_module(obj: nn.Module, filename: str):
     torch.save(out_dict, filename)
 
 
-def load_module(filename: str, **kwargs) -> nn.Module:
+def load_module(filename: str, strict: bool = False, **kwargs) -> nn.Module:
+    """
+    Load a module from a checkpoint.
+    
+    Args:
+        filename: Path to checkpoint file
+        strict: If True, requires exact state_dict match. If False, ignores unexpected keys.
+        **kwargs: Additional arguments passed to object constructor
+    """
     # Load to CPU first for cross-device compatibility (CUDA -> MPS, etc.)
     in_dict = torch.load(filename, map_location="cpu", weights_only=False)
     obj = object_from_config(in_dict["config"], **kwargs)
-    obj.load_state_dict(in_dict["state_dict"])
+    obj.load_state_dict(in_dict["state_dict"], strict=strict)
     return obj
 
 
@@ -1240,4 +1248,32 @@ class LPIPSLoss(nn.Module):
         for fi, ft in zip(feats_inp, feats_tgt):
             loss = loss + F.l1_loss(fi, ft)
         return loss
+
+    def state_dict(self, *args, **kwargs):
+        """
+        Exclude VGG weights from state_dict.
+        
+        VGG is frozen and lazily loaded from torchvision,
+        so we don't need to save its weights.
+        """
+        full_state = super().state_dict(*args, **kwargs)
+        # Filter out _vgg weights
+        filtered_state = {
+            k: v for k, v in full_state.items()
+            if not k.startswith("_vgg.")
+        }
+        return filtered_state
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """
+        Override to ignore _vgg keys when loading.
+        
+        This ensures backward compatibility with checkpoints that may have saved VGG weights.
+        """
+        # Remove any _vgg keys from unexpected_keys if they exist
+        vgg_keys = [k for k in unexpected_keys if k.startswith(prefix + "_vgg.")]
+        for k in vgg_keys:
+            unexpected_keys.remove(k)
+        
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 register_type("LPIPSLoss", LPIPSLoss)
