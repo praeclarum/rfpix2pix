@@ -56,7 +56,7 @@
         "type": "Velocity",
         "net": {
             "type": "UNet",
-            "model_channels": 96,
+            "model_channels": 192,
             "ch_mult": [
                 1,
                 2,
@@ -65,7 +65,15 @@
             "normalization": "GroupNorm32",
             "activation": "SiLU",
             "num_res_blocks": 2,
-            "zero_res_blocks": false
+            "zero_res_blocks": false,
+            "attention_resolutions": [
+                1,
+                2
+            ],
+            "num_attention_heads": 8,
+            "downsample": "StridedConv",
+            "upsample": "NearestConv",
+            "mid_attention": true
         },
         "sample_batch_size": 8,
         "train_batch_size": 64,

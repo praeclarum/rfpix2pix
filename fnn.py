@@ -58,7 +58,7 @@ def save_module(obj: nn.Module, filename: str):
         "state_dict": obj.state_dict(),
     }
     torch.save(out_dict, filename)
-def load_module(filename: str, strict: bool = True, **kwargs) -> nn.Module:
+def load_module(filename: str, strict: bool = False, **kwargs) -> nn.Module:
     # Load to CPU first for cross-device compatibility (CUDA -> MPS, etc.)
     in_dict = torch.load(filename, map_location="cpu", weights_only=False)
     obj = object_from_config(in_dict["config"], **kwargs)
@@ -256,6 +256,9 @@ class UNet(nn.Module):
         attention_resolutions: list[int] = [],
         num_attention_heads: int = 8,
         output_activation: str = "None",
+        downsample: str = "AvgPool",
+        upsample: str = "Bilinear",
+        mid_attention: bool = False,
     ):
         super().__init__()
         self.dtype = torch.float32
@@ -296,11 +299,11 @@ class UNet(nn.Module):
             skip_ch = out_ch
             prev_ch = 0 if i == len(ch_mult) - 1 else model_channels * ch_mult[i + 1]
             if i < len(ch_mult) - 1:
-                down_blocks.append(nn.AvgPool2d(2))
+                down_blocks.append(get_downsample(downsample, out_ch))
             dec_blocks.append(res_block(skip_ch + prev_ch, out_ch))
             time_proj_dec.append(nn.Linear(time_embed_dim, out_ch))
             should_upsample = i > 0
-            up_blocks.append(nn.UpsamplingBilinear2d(scale_factor=2) if should_upsample else nn.Identity())
+            up_blocks.append(get_upsample(upsample, out_ch) if should_upsample else nn.Identity())
             # Self-attention at specified resolution levels
             if i in attention_resolutions:
                 enc_attn.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
@@ -317,6 +320,14 @@ class UNet(nn.Module):
         self.time_proj_dec = nn.ModuleList(time_proj_dec)
         self.enc_attn = nn.ModuleList(enc_attn)
         self.dec_attn = nn.ModuleList(dec_attn)
+        # Mid block: ResBlock -> SelfAttention -> ResBlock (SD-style bottleneck)
+        self.has_mid_block = mid_attention
+        if mid_attention:
+            deepest_ch = model_channels * ch_mult[-1]
+            self.mid_res1 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)
+            self.mid_attn = SelfAttention2d(deepest_ch, num_heads=num_attention_heads, normalization=normalization)
+            self.mid_res2 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)
+            self.time_proj_mid = nn.Linear(time_embed_dim, deepest_ch)
         self.output_block = nn.Sequential(
             res_block(model_channels, model_channels),
             get_normalization(normalization, model_channels),
@@ -350,6 +361,14 @@ class UNet(nn.Module):
             res_hs.append(h)
             if i < len(self.down_blocks):
                 h = self.down_blocks[i](h)
+
+        # Mid block
+        if self.has_mid_block:
+            h = self.mid_res1(h)
+            t_mid = self.time_proj_mid(t_emb)[:, :, None, None]
+            h = h + t_mid
+            h = self.mid_attn(h)
+            h = self.mid_res2(h)
 
         # Decoder
         i = len(self.dec_blocks) - 1
