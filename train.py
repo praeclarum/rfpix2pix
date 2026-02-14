@@ -148,21 +148,24 @@ if __name__ == "__main__":
         # Copy codec state from the checkpoint's run directory
         prev_run_dir = os.path.dirname(args.codec_ckpt)
         _copy_state_file(prev_run_dir, run_dir, CODEC_STATE_FILE)
-    
+        shutil.copy(args.codec_ckpt, os.path.join(run_dir, "codec_initial.ckpt"))
+
     if args.saliency_ckpt:
         print(f"{C.BLUE}▶ Loading saliency from {C.BOLD}{args.saliency_ckpt}{C.RESET}")
         model.saliency = load_module(args.saliency_ckpt).to(device) # type: ignore
         # Copy saliency state from the checkpoint's run directory
         prev_run_dir = os.path.dirname(args.saliency_ckpt)
         _copy_state_file(prev_run_dir, run_dir, SALIENCY_STATE_FILE)
-    
+        shutil.copy(args.saliency_ckpt, os.path.join(run_dir, "saliency_initial.ckpt"))
+
     if args.velocity_ckpt:
         print(f"{C.BLUE}▶ Loading velocity from {C.BOLD}{args.velocity_ckpt}{C.RESET}")
         model.velocity = load_module(args.velocity_ckpt).to(device) # type: ignore
         # Extract step from checkpoint filename (e.g., velocity_run_xxx_001000.ckpt -> 1000)
         step_start = int(args.velocity_ckpt.split("_")[-1].split(".")[0])
         print(f"{C.BLUE}▶ Resuming velocity from step {C.CYAN}{step_start}{C.RESET}")
-    
+        shutil.copy(args.velocity_ckpt, os.path.join(run_dir, "velocity_initial.ckpt"))
+
     model.compile()
     
     # Create dataset
