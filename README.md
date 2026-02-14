@@ -208,33 +208,6 @@ Higher `structure_candidates` values provide more variety but less strict matchi
 - **MPS**: Apple Silicon GPU support
 - **CPU**: Fallback when no GPU is available
 
-## Future Improvements
-
-### FiLM Conditioning in ResBlocks
-
-The current UNet injects timestep information by adding a projected embedding **after** each ResBlock stack:
-
-```
-h = ResBlock(h)
-h = h + Linear(t_emb)  # additive bias, applied after the block
-```
-
-This means the ResBlock's internal convolutions operate without any awareness of the current timestep. The time signal only modulates the output as a spatially-uniform bias.
-
-Stable Diffusion's UNet uses **FiLM conditioning** (Feature-wise Linear Modulation), also called Adaptive Group Normalization (AdaGN). The timestep embedding is injected *inside* each ResBlock, modulating the GroupNorm parameters between the two convolution layers:
-
-```
-h = Conv(norm(h))             # first conv with pre-norm
-scale, shift = Linear(t_emb)  # project time to per-channel scale + shift
-h = scale * GroupNorm(h) + shift  # modulate normalization (FiLM)
-h = Conv(h)                   # second conv
-h = h + skip                  # residual
-```
-
-**Why it matters:** FiLM gives each layer two degrees of freedom per channel (scale and shift) instead of one (bias only). The scale component is particularly important — it allows the network to amplify or suppress individual feature channels based on the timestep. At early flow times (t≈0, near the source domain / noise), the network may need very different feature responses than at late times (t≈1, near the target domain). Additive-only conditioning can adjust feature *levels* but cannot *gate* features on or off.
-
-**Implementation cost:** This requires modifying `ResBlock` to accept a conditioning vector and splitting its `forward()` into two halves around the modulated norm. Since `ResBlock` is shared across the entire codebase (UNet, Encoder, Decoder, codec nets), the change must be backward-compatible — the conditioning input should be optional, defaulting to the current unconditional behavior.
-
 ## License
 
 See [LICENSE](LICENSE) for details.

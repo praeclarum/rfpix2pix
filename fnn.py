@@ -139,33 +139,75 @@ class ResBlock(nn.Module):
         input_kernel_size=3,
         kernel_size=3,
         zero_out=False,
+        time_embed_dim: int = 0,
     ):
         super().__init__()
+        self.time_embed_dim = time_embed_dim
         self.in_layers = nn.Sequential(
             get_normalization(normalization, in_channels),
             get_activation(activation),
             nn.Conv2d(in_channels, out_channels, kernel_size=input_kernel_size, padding=input_kernel_size//2),
         )
-        self.out_layers = nn.Sequential(
-            get_normalization(normalization, out_channels),
-            get_activation(activation),
-            zero_module(
+        if time_embed_dim > 0:
+            # FiLM mode: store norm/act/conv separately so we can inject
+            # scale+shift between the norm and activation.
+            self.out_norm = get_normalization(normalization, out_channels)
+            self.out_act = get_activation(activation)
+            self.out_conv = zero_module(
                 nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2),
                 should_zero=zero_out,
-            ),
-        )
+            )
+            # Project time embedding to per-channel scale and shift
+            self.time_proj = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, 2 * out_channels),
+            )
+        else:
+            # Default mode: plain sequential (no time conditioning)
+            self.out_layers = nn.Sequential(
+                get_normalization(normalization, out_channels),
+                get_activation(activation),
+                zero_module(
+                    nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2),
+                    should_zero=zero_out,
+                ),
+            )
         if out_channels == in_channels:
             self.skip_connection = nn.Identity()
         else:
             self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, t_emb=None):
         h = self.in_layers(x)
-        h = self.out_layers(h)
+        if self.time_embed_dim > 0 and t_emb is not None:
+            # FiLM: modulate the norm output with learned scale + shift
+            h = self.out_norm(h)
+            scale_shift = self.time_proj(t_emb)  # (B, 2*C)
+            scale, shift = scale_shift.chunk(2, dim=1)
+            h = h * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
+            h = self.out_act(h)
+            h = self.out_conv(h)
+        else:
+            h = self.out_layers(h)
         skip = self.skip_connection(x)
         out = skip + h
         return out
 register_type("ResBlock", ResBlock)
+
+
+class ResBlockSequence(nn.Module):
+    """A sequence of ResBlocks that forwards an optional t_emb to each block.
+    Drop-in replacement for nn.Sequential(*resblocks) when FiLM conditioning
+    is needed."""
+
+    def __init__(self, blocks: list[ResBlock]):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x, t_emb=None):
+        for block in self.blocks:
+            x = block(x, t_emb)
+        return x
 
 
 class SelfAttention2d(nn.Module):
@@ -259,12 +301,14 @@ class UNet(nn.Module):
         downsample: str = "AvgPool",
         upsample: str = "Bilinear",
         mid_attention: bool = False,
+        time_conditioning: str = "Additive",
     ):
         super().__init__()
         self.dtype = torch.float32
         self.model_channels = model_channels
         self.num_downsamples = len(ch_mult)
         self.attention_resolutions = attention_resolutions
+        self.time_conditioning = time_conditioning
 
         # Timestep embedding MLP
         time_embed_dim = model_channels * 4
@@ -274,6 +318,8 @@ class UNet(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
 
+        use_film = (time_conditioning == "FiLM")
+
         self.input_block = nn.Sequential(
             nn.Conv2d(input_channels, model_channels, kernel_size=5, padding=2),
         )
@@ -281,11 +327,20 @@ class UNet(nn.Module):
         dec_blocks = []
         down_blocks = []
         up_blocks = []
-        time_proj_enc = []  # project time embedding to each encoder level
-        time_proj_dec = []  # project time embedding to each decoder level
+        time_proj_enc = []  # project time embedding to each encoder level (additive only)
+        time_proj_dec = []  # project time embedding to each decoder level (additive only)
         ch = model_channels
         time_embed_dim = model_channels * 4
+        film_dim = time_embed_dim if use_film else 0
         def res_block(in_ch, out_ch):
+            blocks = [ResBlock(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)]
+            for _ in range(num_res_blocks - 1):
+                blocks.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim))
+            if use_film:
+                return ResBlockSequence(blocks)
+            return nn.Sequential(*blocks)
+        def res_block_plain(in_ch, out_ch):
+            """Unconditional ResBlock stack (no time conditioning)."""
             blocks = [ResBlock(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)]
             for _ in range(num_res_blocks - 1):
                 blocks.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks))
@@ -295,13 +350,15 @@ class UNet(nn.Module):
         for i, ch_m in enumerate(ch_mult):
             out_ch = model_channels * ch_m
             enc_blocks.append(res_block(ch, out_ch))
-            time_proj_enc.append(nn.Linear(time_embed_dim, out_ch))
+            if not use_film:
+                time_proj_enc.append(nn.Linear(time_embed_dim, out_ch))
             skip_ch = out_ch
             prev_ch = 0 if i == len(ch_mult) - 1 else model_channels * ch_mult[i + 1]
             if i < len(ch_mult) - 1:
                 down_blocks.append(get_downsample(downsample, out_ch))
             dec_blocks.append(res_block(skip_ch + prev_ch, out_ch))
-            time_proj_dec.append(nn.Linear(time_embed_dim, out_ch))
+            if not use_film:
+                time_proj_dec.append(nn.Linear(time_embed_dim, out_ch))
             should_upsample = i > 0
             up_blocks.append(get_upsample(upsample, out_ch) if should_upsample else nn.Identity())
             # Self-attention at specified resolution levels
@@ -324,12 +381,13 @@ class UNet(nn.Module):
         self.has_mid_block = mid_attention
         if mid_attention:
             deepest_ch = model_channels * ch_mult[-1]
-            self.mid_res1 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)
+            self.mid_res1 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)
             self.mid_attn = SelfAttention2d(deepest_ch, num_heads=num_attention_heads, normalization=normalization)
-            self.mid_res2 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)
-            self.time_proj_mid = nn.Linear(time_embed_dim, deepest_ch)
+            self.mid_res2 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)
+            if not use_film:
+                self.time_proj_mid = nn.Linear(time_embed_dim, deepest_ch)
         self.output_block = nn.Sequential(
-            res_block(model_channels, model_channels),
+            res_block_plain(model_channels, model_channels),
             get_normalization(normalization, model_channels),
             get_activation(activation),
             nn.Conv2d(model_channels, output_channels, kernel_size=3, padding=1),
@@ -348,15 +406,20 @@ class UNet(nn.Module):
         t_emb = get_timestep_embedding(t, self.model_channels)  # (B, model_channels)
         t_emb = self.time_embed(t_emb)  # (B, time_embed_dim)
 
+        use_film = (self.time_conditioning == "FiLM")
+
         h = self.input_block(x)
         res_hs = []
 
         # Encoder
         for i, enc_block in enumerate(self.enc_blocks):
-            h = enc_block(h)
-            # Add time embedding (broadcast over H, W)
-            t_proj = self.time_proj_enc[i](t_emb)[:, :, None, None]  # (B, C, 1, 1)
-            h = h + t_proj
+            if use_film:
+                h = enc_block(h, t_emb)
+            else:
+                h = enc_block(h)
+                # Add time embedding (broadcast over H, W)
+                t_proj = self.time_proj_enc[i](t_emb)[:, :, None, None]  # (B, C, 1, 1)
+                h = h + t_proj
             h = self.enc_attn[i](h)
             res_hs.append(h)
             if i < len(self.down_blocks):
@@ -364,11 +427,17 @@ class UNet(nn.Module):
 
         # Mid block
         if self.has_mid_block:
-            h = self.mid_res1(h)
-            t_mid = self.time_proj_mid(t_emb)[:, :, None, None]
-            h = h + t_mid
+            if use_film:
+                h = self.mid_res1(h, t_emb)
+            else:
+                h = self.mid_res1(h)
+                t_mid = self.time_proj_mid(t_emb)[:, :, None, None]
+                h = h + t_mid
             h = self.mid_attn(h)
-            h = self.mid_res2(h)
+            if use_film:
+                h = self.mid_res2(h, t_emb)
+            else:
+                h = self.mid_res2(h)
 
         # Decoder
         i = len(self.dec_blocks) - 1
@@ -376,13 +445,17 @@ class UNet(nn.Module):
             if i < len(self.dec_blocks) - 1:
                 # Upsample FIRST, then concatenate with skip connection
                 h = self.up_blocks[i + 1](h)
-                h = self.dec_blocks[i](torch.cat([h, res_hs[i]], dim=1))
+                h_in = torch.cat([h, res_hs[i]], dim=1)
             else:
                 # Bottleneck: no skip connection, no upsampling before
-                h = self.dec_blocks[i](h)
-            # Add time embedding
-            t_proj = self.time_proj_dec[i](t_emb)[:, :, None, None]
-            h = h + t_proj
+                h_in = h
+            if use_film:
+                h = self.dec_blocks[i](h_in, t_emb)
+            else:
+                h = self.dec_blocks[i](h_in)
+                # Add time embedding
+                t_proj = self.time_proj_dec[i](t_emb)[:, :, None, None]
+                h = h + t_proj
             h = self.dec_attn[i](h)
             i -= 1
 
