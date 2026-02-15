@@ -189,9 +189,7 @@ class ResBlock(nn.Module):
             h = self.out_conv(h)
         else:
             h = self.out_layers(h)
-        skip = self.skip_connection(x)
-        out = skip + h
-        return out
+        return self.skip_connection(x) + h
 register_type("ResBlock", ResBlock)
 
 
@@ -214,14 +212,9 @@ class SelfAttention2d(nn.Module):
     """
     Spatial self-attention for 2D feature maps.
 
-    Uses only CoreML/ANE-safe operations:
-    - 1x1 Conv2d for Q/K/V and output projections
-    - reshape + permute for head splitting
-    - torch.bmm for attention matmul
-    - softmax(dim=-1)
-
-    Applies pre-norm (GroupNorm) and a zero-initialized output projection
-    for stable residual learning: output = x + proj(attn(norm(x))).
+    Applies pre-norm (GroupNorm), multi-head scaled dot-product attention,
+    and a zero-initialized output projection for stable residual learning:
+    output = x + proj(attn(norm(x))).
     """
 
     def __init__(self, channels: int, num_heads: int = 8, normalization: str = "GroupNorm32"):
@@ -230,7 +223,6 @@ class SelfAttention2d(nn.Module):
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5  # Pre-compute for FP16 safety
 
         self.norm = get_normalization(normalization, channels)
         self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
@@ -239,46 +231,32 @@ class SelfAttention2d(nn.Module):
         self.out_proj = zero_module(nn.Conv2d(channels, channels, kernel_size=1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, C, H, W) input feature map
+        b, c, h, w = x.shape
+        r = x
 
-        Returns:
-            (B, C, H, W) output with attended features added as residual
-        """
-        B, C, H, W = x.shape
-        N = H * W  # number of spatial tokens
+        x = self.norm(x)
 
-        h = self.norm(x)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        # Project to Q, K, V using 1x1 convolutions: (B, C, H, W)
-        q = self.q_proj(h)
-        k = self.k_proj(h)
-        v = self.v_proj(h)
+        n = h * w
+        q = q.view(b, self.num_heads, self.head_dim, n).permute(0, 1, 3, 2)
+        k = k.view(b, self.num_heads, self.head_dim, n).permute(0, 1, 3, 2)
+        v = v.view(b, self.num_heads, self.head_dim, n).permute(0, 1, 3, 2)
 
-        # Reshape to (B*heads, N, head_dim) for batched matmul
-        # From (B, C, H, W) -> (B, heads, head_dim, N) -> (B*heads, N, head_dim)
-        q = q.reshape(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).reshape(B * self.num_heads, N, self.head_dim)
-        k = k.reshape(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).reshape(B * self.num_heads, N, self.head_dim)
-        v = v.reshape(B, self.num_heads, self.head_dim, N).permute(0, 1, 3, 2).reshape(B * self.num_heads, N, self.head_dim)
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+        )
 
-        # Scale Q before matmul for FP16 numerical stability
-        q = q * self.scale
-
-        # Attention: (B*heads, N, N)
-        attn = torch.bmm(q, k.transpose(1, 2))
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention to values: (B*heads, N, head_dim)
-        out = torch.bmm(attn, v)
-
-        # Reshape back to (B, C, H, W)
-        # (B*heads, N, head_dim) -> (B, heads, N, head_dim) -> (B, heads, head_dim, N) -> (B, C, H, W)
-        out = out.reshape(B, self.num_heads, N, self.head_dim).permute(0, 1, 3, 2).reshape(B, C, H, W)
-
-        # Zero-initialized output projection + residual
+        out = out.permute(0, 1, 3, 2).reshape(b, c, h, w)
         out = self.out_proj(out)
-        return x + out
+        return r + out
 
 
 #
