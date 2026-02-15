@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 #
 # DEVICE
 #
@@ -120,6 +121,42 @@ def get_upsample(upsample: str, channels: int) -> nn.Module:
         )
     raise NotImplementedError(f"Unknown upsample: {upsample}")
 
+def get_downsample_3d(downsample: str, channels: int) -> nn.Module:
+    if downsample == "AvgPool":
+        return nn.AvgPool3d(2)
+    if downsample == "StridedConv":
+        return nn.Conv3d(channels, channels, kernel_size=3, stride=2, padding=1)
+    raise NotImplementedError(f"Unknown downsample: {downsample}")
+
+def get_upsample_3d(upsample: str, channels: int) -> nn.Module:
+    if upsample == "Bilinear":
+        return nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+    if upsample == "NearestConv":
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+        )
+    raise NotImplementedError(f"Unknown upsample: {upsample}")
+
+def get_downsample_td(downsample: str, channels: int) -> nn.Module:
+    """Temporal-preserving downsample for video tensors (B, C, T, H, W)."""
+    if downsample == "AvgPool":
+        return nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
+    if downsample == "StridedConv":
+        return nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
+    raise NotImplementedError(f"Unknown downsample: {downsample}")
+
+def get_upsample_td(upsample: str, channels: int) -> nn.Module:
+    """Temporal-preserving upsample for video tensors (B, C, T, H, W)."""
+    if upsample == "Bilinear":
+        return nn.Upsample(scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+    if upsample == "NearestConv":
+        return nn.Sequential(
+            nn.Upsample(scale_factor=(1, 2, 2), mode="nearest"),
+            nn.Conv3d(channels, channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+        )
+    raise NotImplementedError(f"Unknown upsample: {upsample}")
+
 def zero_module(module: nn.Module, should_zero: bool = True):
     """
     Zero out the parameters of a module and return it.
@@ -150,7 +187,31 @@ class TimestepSequential(nn.Sequential):
                 x = layer(x)
         return x
 
+def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch.Tensor:
+    """
+    Sinusoidal timestep embeddings (same as DDPM / Transformer positional encoding).
+    
+    Args:
+        timesteps: (B,) tensor of timestep values in [0, 1]
+        embedding_dim: dimension of the output embedding
+        
+    Returns:
+        (B, embedding_dim) tensor of embeddings
+    """
+    assert len(timesteps.shape) == 1
+    half_dim = embedding_dim // 2
+    emb = math.log(10000.0) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb)
+    emb = timesteps[:, None].float() * emb[None, :] * 1000.0  # scale to match diffusion convention
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
 
+
+#
+# 2D BLOCKS (image models)
+#
 class ResBlock(TimestepBlock):
     """Residual block with optional FiLM time conditioning.
 
@@ -207,7 +268,7 @@ class ResBlock(TimestepBlock):
 register_type("ResBlock", ResBlock)
 
 
-class SelfAttention2d(nn.Module):
+class SelfAttention(nn.Module):
     """
     Spatial self-attention for 2D feature maps.
 
@@ -258,9 +319,6 @@ class SelfAttention2d(nn.Module):
         return r + out
 
 
-#
-# UNet
-#
 class UNet(nn.Module):
     def __init__(
         self,
@@ -327,8 +385,8 @@ class UNet(nn.Module):
             up_blocks.append(get_upsample(upsample, out_ch) if should_upsample else nn.Identity())
             # Self-attention at specified resolution levels
             if i in attention_resolutions:
-                enc_attn.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
-                dec_attn.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
+                enc_attn.append(SelfAttention(out_ch, num_heads=num_attention_heads, normalization=normalization))
+                dec_attn.append(SelfAttention(out_ch, num_heads=num_attention_heads, normalization=normalization))
             else:
                 enc_attn.append(nn.Identity())
                 dec_attn.append(nn.Identity())
@@ -344,7 +402,7 @@ class UNet(nn.Module):
         if mid_attention:
             deepest_ch = model_channels * ch_mult[-1]
             self.mid_res1 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)
-            self.mid_attn = SelfAttention2d(deepest_ch, num_heads=num_attention_heads, normalization=normalization)
+            self.mid_attn = SelfAttention(deepest_ch, num_heads=num_attention_heads, normalization=normalization)
             self.mid_res2 = ResBlock(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)
         self.output_block = nn.Sequential(
             res_block_plain(model_channels, model_channels),
@@ -795,14 +853,14 @@ class Encoder(nn.Module):
             for _ in range(num_res_blocks - 1):
                 layers.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation))
             if i in attention_resolutions:
-                layers.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
+                layers.append(SelfAttention(out_ch, num_heads=num_attention_heads, normalization=normalization))
             if i < len(ch_mult) - 1:
                 layers.append(get_downsample(downsample, out_ch))
             ch = out_ch
         # Mid block
         layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         if mid_attention:
-            layers.append(SelfAttention2d(ch, num_heads=num_attention_heads, normalization=normalization))
+            layers.append(SelfAttention(ch, num_heads=num_attention_heads, normalization=normalization))
             layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         # Project to latent
         layers.append(get_normalization(normalization, ch))
@@ -848,7 +906,7 @@ class Decoder(nn.Module):
         # Mid block
         layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         if mid_attention:
-            layers.append(SelfAttention2d(ch, num_heads=num_attention_heads, normalization=normalization))
+            layers.append(SelfAttention(ch, num_heads=num_attention_heads, normalization=normalization))
             layers.append(ResBlock(ch, ch, normalization=normalization, activation=activation))
         # Upsample levels (reversed)
         for i in reversed(range(len(ch_mult))):
@@ -857,7 +915,7 @@ class Decoder(nn.Module):
             for _ in range(num_res_blocks - 1):
                 layers.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation))
             if i in attention_resolutions:
-                layers.append(SelfAttention2d(out_ch, num_heads=num_attention_heads, normalization=normalization))
+                layers.append(SelfAttention(out_ch, num_heads=num_attention_heads, normalization=normalization))
             ch = out_ch
             if i > 0:
                 layers.append(get_upsample(upsample, ch))
@@ -968,76 +1026,118 @@ register_type("VAE", VAE)
 
 
 #
-# 3D BLOCKS (for temporal models)
+# 3D BLOCKS (volumetric models)
 #
-class ResBlock3d(nn.Module):
-    """3D ResBlock with Conv3d. Mirrors ResBlock but with temporal dimension."""
+class ResBlock3d(TimestepBlock):
+    """3D residual block with optional FiLM time conditioning.
+
+    - If `time_embed_dim > 0`, `forward(x, t_emb)` applies FiLM modulation.
+    - If `time_embed_dim == 0`, the block is unconditional and ignores `t_emb`.
+    """
+
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
+        in_channels,
+        out_channels,
         normalization: str,
         activation: str,
-        kernel_size: int = 3,
-        zero_out: bool = False,
+        input_kernel_size=3,
+        kernel_size=3,
+        zero_out=False,
+        time_embed_dim: int = 0,
     ):
         super().__init__()
-        padding = kernel_size // 2
-        # GroupNorm works on channels, agnostic to spatial dims
+        self.time_embed_dim = time_embed_dim
         self.in_layers = nn.Sequential(
             get_normalization(normalization, in_channels),
             get_activation(activation),
-            nn.Conv3d(in_channels, out_channels, kernel_size=kernel_size, padding=padding),
+            nn.Conv3d(in_channels, out_channels, kernel_size=input_kernel_size, padding=input_kernel_size//2),
         )
-        self.out_layers = nn.Sequential(
-            get_normalization(normalization, out_channels),
-            get_activation(activation),
-            zero_module(
-                nn.Conv3d(out_channels, out_channels, kernel_size=kernel_size, padding=padding),
-                should_zero=zero_out,
-            ),
+        self.out_norm = get_normalization(normalization, out_channels)
+        self.out_act = get_activation(activation)
+        self.out_conv = zero_module(
+            nn.Conv3d(out_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2),
+            should_zero=zero_out,
         )
+        if time_embed_dim > 0:
+            self.time_proj = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, 2 * out_channels),
+            )
         if out_channels == in_channels:
             self.skip_connection = nn.Identity()
         else:
             self.skip_connection = nn.Conv3d(in_channels, out_channels, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, C, T, H, W)"""
+    def forward(self, x: torch.Tensor, t_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
         h = self.in_layers(x)
-        h = self.out_layers(h)
-        skip = self.skip_connection(x)
-        return skip + h
+        h = self.out_norm(h)
+        if self.time_embed_dim > 0 and t_emb is not None:
+            scale_shift = self.time_proj(t_emb)  # (B, 2*C)
+            scale, shift = scale_shift.chunk(2, dim=1)
+            h = h * (1.0 + scale[:, :, None, None, None]) + shift[:, :, None, None, None]
+        h = self.out_act(h)
+        h = self.out_conv(h)
+        return self.skip_connection(x) + h
 register_type("ResBlock3d", ResBlock3d)
 
 
-def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch.Tensor:
+class SelfAttention3d(nn.Module):
     """
-    Sinusoidal timestep embeddings (same as DDPM / Transformer positional encoding).
-    
-    Args:
-        timesteps: (B,) tensor of timestep values in [0, 1]
-        embedding_dim: dimension of the output embedding
-        
-    Returns:
-        (B, embedding_dim) tensor of embeddings
+    Self-attention for volumetric 3D feature maps.
+
+    Applies pre-norm (GroupNorm), multi-head scaled dot-product attention,
+    and a zero-initialized output projection for stable residual learning:
+    output = x + proj(attn(norm(x))).
     """
-    assert len(timesteps.shape) == 1
-    half_dim = embedding_dim // 2
-    emb = math.log(10000.0) / (half_dim - 1)
-    emb = torch.exp(torch.arange(half_dim, device=timesteps.device, dtype=torch.float32) * -emb)
-    emb = timesteps[:, None].float() * emb[None, :] * 1000.0  # scale to match diffusion convention
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-    if embedding_dim % 2 == 1:
-        emb = F.pad(emb, (0, 1))
-    return emb
+
+    def __init__(self, channels: int, num_heads: int = 8, normalization: str = "GroupNorm32"):
+        super().__init__()
+        assert channels % num_heads == 0, f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+
+        self.norm = get_normalization(normalization, channels)
+        self.q_proj = nn.Conv3d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv3d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv3d(channels, channels, kernel_size=1)
+        self.out_proj = zero_module(nn.Conv3d(channels, channels, kernel_size=1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, d, h, w = x.shape
+        r = x
+
+        x = self.norm(x)
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        n = d * h * w
+        q = q.view(b, self.num_heads, self.head_dim, n).permute(0, 1, 3, 2)
+        k = k.view(b, self.num_heads, self.head_dim, n).permute(0, 1, 3, 2)
+        v = v.view(b, self.num_heads, self.head_dim, n).permute(0, 1, 3, 2)
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+
+        out = out.permute(0, 1, 3, 2).reshape(b, c, d, h, w)
+        out = self.out_proj(out)
+        return r + out
 
 
 class UNet3d(nn.Module):
     """
-    3D UNet for temporal sequence generation.
-    Downsamples spatially only, preserves temporal dimension.
-    Supports timestep conditioning via additive embedding.
+    Volumetric 3D UNet.
+
+    Mirrors UNet with Conv3d/attention3d blocks and FiLM timestep conditioning.
     """
     def __init__(
         self,
@@ -1049,11 +1149,18 @@ class UNet3d(nn.Module):
         activation: str,
         num_res_blocks: int,
         zero_res_blocks: bool = False,
+        attention_resolutions: list[int] = [],
+        num_attention_heads: int = 8,
+        output_activation: str = "None",
+        downsample: str = "AvgPool",
+        upsample: str = "Bilinear",
+        mid_attention: bool = False,
     ):
         super().__init__()
         self.dtype = torch.float32
         self.model_channels = model_channels
         self.num_downsamples = len(ch_mult)
+        self.attention_resolutions = attention_resolutions
 
         # Timestep embedding MLP
         time_embed_dim = model_channels * 4
@@ -1063,19 +1170,26 @@ class UNet3d(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        # Input projection
-        self.input_block = nn.Conv3d(input_channels, model_channels, kernel_size=3, padding=1)
+        self.input_block = nn.Sequential(
+            nn.Conv3d(input_channels, model_channels, kernel_size=5, padding=2),
+        )
 
         enc_blocks = []
         dec_blocks = []
         down_blocks = []
         up_blocks = []
-        time_proj_enc = []  # project time embedding to each encoder level
-        time_proj_dec = []  # project time embedding to each decoder level
-
+        enc_attn = []
+        dec_attn = []
         ch = model_channels
+        film_dim = time_embed_dim
 
         def res_block(in_ch: int, out_ch: int):
+            blocks = [ResBlock3d(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)]
+            for _ in range(num_res_blocks - 1):
+                blocks.append(ResBlock3d(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim))
+            return TimestepSequential(*blocks)
+
+        def res_block_plain(in_ch: int, out_ch: int):
             blocks = [ResBlock3d(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)]
             for _ in range(num_res_blocks - 1):
                 blocks.append(ResBlock3d(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks))
@@ -1084,49 +1198,57 @@ class UNet3d(nn.Module):
         for i, ch_m in enumerate(ch_mult):
             out_ch = model_channels * ch_m
             enc_blocks.append(res_block(ch, out_ch))
-            time_proj_enc.append(nn.Linear(time_embed_dim, out_ch))
-            
+
             skip_ch = out_ch
             prev_ch = 0 if i == len(ch_mult) - 1 else model_channels * ch_mult[i + 1]
-            
+
             if i < len(ch_mult) - 1:
-                # Downsample spatially only (kernel 1,2,2 stride 1,2,2)
-                down_blocks.append(nn.AvgPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2)))
-            
+                down_blocks.append(get_downsample_3d(downsample, out_ch))
+
             dec_blocks.append(res_block(skip_ch + prev_ch, out_ch))
-            time_proj_dec.append(nn.Linear(time_embed_dim, out_ch))
-            
+
             should_upsample = i > 0
-            if should_upsample:
-                # Upsample spatially only
-                up_blocks.append(nn.Upsample(scale_factor=(1, 2, 2), mode='nearest'))
+            up_blocks.append(get_upsample_3d(upsample, out_ch) if should_upsample else nn.Identity())
+
+            if i in attention_resolutions:
+                enc_attn.append(SelfAttention3d(out_ch, num_heads=num_attention_heads, normalization=normalization))
+                dec_attn.append(SelfAttention3d(out_ch, num_heads=num_attention_heads, normalization=normalization))
             else:
-                up_blocks.append(nn.Identity())
-            
+                enc_attn.append(nn.Identity())
+                dec_attn.append(nn.Identity())
+
             ch = out_ch
 
         self.enc_blocks = nn.ModuleList(enc_blocks)
         self.down_blocks = nn.ModuleList(down_blocks)
         self.dec_blocks = nn.ModuleList(dec_blocks)
         self.up_blocks = nn.ModuleList(up_blocks)
-        self.time_proj_enc = nn.ModuleList(time_proj_enc)
-        self.time_proj_dec = nn.ModuleList(time_proj_dec)
+        self.enc_attn = nn.ModuleList(enc_attn)
+        self.dec_attn = nn.ModuleList(dec_attn)
+
+        self.has_mid_block = mid_attention
+        if mid_attention:
+            deepest_ch = model_channels * ch_mult[-1]
+            self.mid_res1 = ResBlock3d(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)
+            self.mid_attn = SelfAttention3d(deepest_ch, num_heads=num_attention_heads, normalization=normalization)
+            self.mid_res2 = ResBlock3d(deepest_ch, deepest_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)
 
         self.output_block = nn.Sequential(
-            res_block(model_channels, model_channels),
+            res_block_plain(model_channels, model_channels),
             get_normalization(normalization, model_channels),
             get_activation(activation),
             nn.Conv3d(model_channels, output_channels, kernel_size=3, padding=1),
+            get_activation(output_activation),
         )
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, C, T, H, W) input tensor (noisy sequence + conditioning)
+            x: (B, C, D, H, W) input tensor
             t: (B,) flow timestep in [0, 1]
             
         Returns:
-            (B, C_out, T, H, W) predicted velocity
+            (B, C_out, D, H, W) predicted velocity
         """
         # Timestep embedding
         t_emb = get_timestep_embedding(t, self.model_channels)  # (B, model_channels)
@@ -1134,16 +1256,19 @@ class UNet3d(nn.Module):
 
         h = self.input_block(x)
         res_hs = []
-        
+
         # Encoder
         for i, enc_block in enumerate(self.enc_blocks):
-            h = enc_block(h)
-            # Add time embedding (broadcast over T, H, W)
-            t_proj = self.time_proj_enc[i](t_emb)[:, :, None, None, None]  # (B, C, 1, 1, 1)
-            h = h + t_proj
+            h = enc_block(h, t_emb)
+            h = self.enc_attn[i](h)
             res_hs.append(h)
             if i < len(self.down_blocks):
                 h = self.down_blocks[i](h)
+
+        if self.has_mid_block:
+            h = self.mid_res1(h, t_emb)
+            h = self.mid_attn(h)
+            h = self.mid_res2(h, t_emb)
 
         # Decoder
         i = len(self.dec_blocks) - 1
@@ -1151,21 +1276,406 @@ class UNet3d(nn.Module):
             if i < len(self.dec_blocks) - 1:
                 # Upsample FIRST, then concatenate with skip connection
                 h = self.up_blocks[i + 1](h)
-                h = self.dec_blocks[i](torch.cat([h, res_hs[i]], dim=1))
+                h_in = torch.cat([h, res_hs[i]], dim=1)
             else:
                 # Bottleneck: no skip connection, no upsampling before
-                h = self.dec_blocks[i](h)
-            # Add time embedding
-            t_proj = self.time_proj_dec[i](t_emb)[:, :, None, None, None]
-            h = h + t_proj
+                h_in = h
+            h = self.dec_blocks[i](h_in, t_emb)
+            h = self.dec_attn[i](h)
             i -= 1
-        
+
         # Final upsample (from first encoder level, if needed)
         h = self.up_blocks[0](h)
 
         y = self.output_block(h)
         return y
 register_type("UNet3d", UNet3d)
+
+
+#
+# TD BLOCKS (temporal models)
+#
+class TemporalAttentionTd(nn.Module):
+    """Temporal self-attention for video tensors with per-pixel tokenization over T."""
+
+    def __init__(self, channels: int, num_heads: int = 8, normalization: str = "GroupNorm32"):
+        super().__init__()
+        assert channels % num_heads == 0, f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+
+        self.norm = get_normalization(normalization, channels)
+        self.q_proj = nn.Conv1d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv1d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv1d(channels, channels, kernel_size=1)
+        self.out_proj = zero_module(nn.Conv1d(channels, channels, kernel_size=1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, t, h, w = x.shape
+        r = x
+        x = self.norm(x)
+
+        # (B, C, T, H, W) -> (B*H*W, C, T)
+        seq = x.permute(0, 3, 4, 1, 2).reshape(b * h * w, c, t)
+
+        q = self.q_proj(seq)
+        k = self.k_proj(seq)
+        v = self.v_proj(seq)
+
+        q = q.view(b * h * w, self.num_heads, self.head_dim, t).permute(0, 1, 3, 2)
+        k = k.view(b * h * w, self.num_heads, self.head_dim, t).permute(0, 1, 3, 2)
+        v = v.view(b * h * w, self.num_heads, self.head_dim, t).permute(0, 1, 3, 2)
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+
+        out = out.permute(0, 1, 3, 2).reshape(b * h * w, c, t)
+        out = self.out_proj(out)
+        out = out.reshape(b, h, w, c, t).permute(0, 3, 4, 1, 2)
+        return r + out
+
+
+class SpatialAttentionTd(nn.Module):
+    """Spatial self-attention for video tensors, applied frame-wise."""
+
+    def __init__(self, channels: int, num_heads: int = 8, normalization: str = "GroupNorm32"):
+        super().__init__()
+        self.attn2d = SelfAttention(channels, num_heads=num_heads, normalization=normalization)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, t, h, w = x.shape
+        y = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        y = self.attn2d(y)
+        return y.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
+
+
+class SelfAttentionTd(nn.Module):
+    """Video attention block with optional spatial and temporal sub-attention."""
+
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        normalization: str = "GroupNorm32",
+        spatial_attention: bool = True,
+        temporal_attention: bool = True,
+    ):
+        super().__init__()
+        self.spatial_attn = SpatialAttentionTd(channels, num_heads=num_heads, normalization=normalization) if spatial_attention else nn.Identity()
+        self.temporal_attn = TemporalAttentionTd(channels, num_heads=num_heads, normalization=normalization) if temporal_attention else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.spatial_attn(x)
+        x = self.temporal_attn(x)
+        return x
+
+
+class ResBlockTd(TimestepBlock):
+    """Temporal-aware residual block for video tensors.
+
+    Compared to `ResBlock3d`, this block treats the 3rd axis as time and uses
+    factorized convolutions to keep temporal/spatial mixing distinct:
+    - Spatial convs use kernels `(1, k, k)`.
+    - Temporal convs use kernels `(k_t, 1, 1)`.
+    - Down/up sampling in `UNetTd` preserves temporal length.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        normalization: str,
+        activation: str,
+        input_kernel_size=3,
+        kernel_size=3,
+        temporal_kernel_size: int = 3,
+        zero_out=False,
+        time_embed_dim: int = 0,
+    ):
+        super().__init__()
+        self.time_embed_dim = time_embed_dim
+
+        self.in_layers = nn.Sequential(
+            get_normalization(normalization, in_channels),
+            get_activation(activation),
+            nn.Conv3d(
+                in_channels,
+                out_channels,
+                kernel_size=(1, input_kernel_size, input_kernel_size),
+                padding=(0, input_kernel_size // 2, input_kernel_size // 2),
+            ),
+        )
+        self.in_temporal = nn.Conv3d(
+            out_channels,
+            out_channels,
+            kernel_size=(temporal_kernel_size, 1, 1),
+            padding=(temporal_kernel_size // 2, 0, 0),
+        )
+
+        self.out_norm = get_normalization(normalization, out_channels)
+        self.out_act = get_activation(activation)
+        self.out_spatial = nn.Conv3d(
+            out_channels,
+            out_channels,
+            kernel_size=(1, kernel_size, kernel_size),
+            padding=(0, kernel_size // 2, kernel_size // 2),
+        )
+        self.out_temporal = zero_module(
+            nn.Conv3d(
+                out_channels,
+                out_channels,
+                kernel_size=(temporal_kernel_size, 1, 1),
+                padding=(temporal_kernel_size // 2, 0, 0),
+            ),
+            should_zero=zero_out,
+        )
+
+        if time_embed_dim > 0:
+            self.time_proj = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, 2 * out_channels),
+            )
+
+        if out_channels == in_channels:
+            self.skip_connection = nn.Identity()
+        else:
+            self.skip_connection = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, t_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        h = self.in_layers(x)
+        h = self.in_temporal(h)
+        h = self.out_norm(h)
+        if self.time_embed_dim > 0 and t_emb is not None:
+            scale_shift = self.time_proj(t_emb)  # (B, 2*C)
+            scale, shift = scale_shift.chunk(2, dim=1)
+            h = h * (1.0 + scale[:, :, None, None, None]) + shift[:, :, None, None, None]
+        h = self.out_act(h)
+        h = self.out_spatial(h)
+        h = self.out_temporal(h)
+        return self.skip_connection(x) + h
+register_type("ResBlockTd", ResBlockTd)
+
+
+class UNetTd(nn.Module):
+    """Temporal-aware UNet for video generation.
+
+    Compared to `UNet3d` (volumetric):
+    - Interprets the 3rd axis as time `(B, C, T, H, W)`.
+    - Down/upsamples spatial axes only, preserving sequence length.
+    - Uses `ResBlockTd` and `SelfAttentionTd` (spatial + temporal attention).
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int,
+        model_channels: int,
+        ch_mult: list[int],
+        normalization: str,
+        activation: str,
+        num_res_blocks: int,
+        zero_res_blocks: bool = False,
+        attention_resolutions: list[int] = [],
+        num_attention_heads: int = 8,
+        output_activation: str = "None",
+        downsample: str = "AvgPool",
+        upsample: str = "Bilinear",
+        mid_attention: bool = False,
+        temporal_kernel_size: int = 3,
+        spatial_attention: bool = True,
+        temporal_attention: bool = True,
+    ):
+        super().__init__()
+        self.dtype = torch.float32
+        self.model_channels = model_channels
+        self.num_downsamples = len(ch_mult)
+        self.attention_resolutions = attention_resolutions
+
+        time_embed_dim = model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(model_channels, time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, time_embed_dim),
+        )
+
+        self.input_block = nn.Sequential(
+            nn.Conv3d(input_channels, model_channels, kernel_size=(1, 5, 5), padding=(0, 2, 2)),
+        )
+
+        enc_blocks = []
+        dec_blocks = []
+        down_blocks = []
+        up_blocks = []
+        enc_attn = []
+        dec_attn = []
+        ch = model_channels
+        film_dim = time_embed_dim
+
+        def res_block(in_ch, out_ch):
+            blocks = [ResBlockTd(
+                in_ch,
+                out_ch,
+                normalization=normalization,
+                activation=activation,
+                zero_out=zero_res_blocks,
+                time_embed_dim=film_dim,
+                temporal_kernel_size=temporal_kernel_size,
+            )]
+            for _ in range(num_res_blocks - 1):
+                blocks.append(ResBlockTd(
+                    out_ch,
+                    out_ch,
+                    normalization=normalization,
+                    activation=activation,
+                    zero_out=zero_res_blocks,
+                    time_embed_dim=film_dim,
+                    temporal_kernel_size=temporal_kernel_size,
+                ))
+            return TimestepSequential(*blocks)
+
+        def res_block_plain(in_ch, out_ch):
+            blocks = [ResBlockTd(
+                in_ch,
+                out_ch,
+                normalization=normalization,
+                activation=activation,
+                zero_out=zero_res_blocks,
+                temporal_kernel_size=temporal_kernel_size,
+            )]
+            for _ in range(num_res_blocks - 1):
+                blocks.append(ResBlockTd(
+                    out_ch,
+                    out_ch,
+                    normalization=normalization,
+                    activation=activation,
+                    zero_out=zero_res_blocks,
+                    temporal_kernel_size=temporal_kernel_size,
+                ))
+            return nn.Sequential(*blocks)
+
+        for i, ch_m in enumerate(ch_mult):
+            out_ch = model_channels * ch_m
+            enc_blocks.append(res_block(ch, out_ch))
+            skip_ch = out_ch
+            prev_ch = 0 if i == len(ch_mult) - 1 else model_channels * ch_mult[i + 1]
+            if i < len(ch_mult) - 1:
+                down_blocks.append(get_downsample_td(downsample, out_ch))
+            dec_blocks.append(res_block(skip_ch + prev_ch, out_ch))
+            should_upsample = i > 0
+            up_blocks.append(get_upsample_td(upsample, out_ch) if should_upsample else nn.Identity())
+            if i in attention_resolutions:
+                enc_attn.append(SelfAttentionTd(
+                    out_ch,
+                    num_heads=num_attention_heads,
+                    normalization=normalization,
+                    spatial_attention=spatial_attention,
+                    temporal_attention=temporal_attention,
+                ))
+                dec_attn.append(SelfAttentionTd(
+                    out_ch,
+                    num_heads=num_attention_heads,
+                    normalization=normalization,
+                    spatial_attention=spatial_attention,
+                    temporal_attention=temporal_attention,
+                ))
+            else:
+                enc_attn.append(nn.Identity())
+                dec_attn.append(nn.Identity())
+            ch = out_ch
+
+        self.enc_blocks = nn.ModuleList(enc_blocks)
+        self.down_blocks = nn.ModuleList(down_blocks)
+        self.dec_blocks = nn.ModuleList(dec_blocks)
+        self.up_blocks = nn.ModuleList(up_blocks)
+        self.enc_attn = nn.ModuleList(enc_attn)
+        self.dec_attn = nn.ModuleList(dec_attn)
+
+        self.has_mid_block = mid_attention
+        if mid_attention:
+            deepest_ch = model_channels * ch_mult[-1]
+            self.mid_res1 = ResBlockTd(
+                deepest_ch,
+                deepest_ch,
+                normalization=normalization,
+                activation=activation,
+                zero_out=zero_res_blocks,
+                time_embed_dim=film_dim,
+                temporal_kernel_size=temporal_kernel_size,
+            )
+            self.mid_attn = SelfAttentionTd(
+                deepest_ch,
+                num_heads=num_attention_heads,
+                normalization=normalization,
+                spatial_attention=spatial_attention,
+                temporal_attention=temporal_attention,
+            )
+            self.mid_res2 = ResBlockTd(
+                deepest_ch,
+                deepest_ch,
+                normalization=normalization,
+                activation=activation,
+                zero_out=zero_res_blocks,
+                time_embed_dim=film_dim,
+                temporal_kernel_size=temporal_kernel_size,
+            )
+
+        self.output_block = nn.Sequential(
+            res_block_plain(model_channels, model_channels),
+            get_normalization(normalization, model_channels),
+            get_activation(activation),
+            nn.Conv3d(model_channels, output_channels, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            get_activation(output_activation),
+        )
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, T, H, W) input tensor
+            t: (B,) flow timestep in [0, 1]
+
+        Returns:
+            (B, C_out, T, H, W) predicted velocity
+        """
+        t_emb = get_timestep_embedding(t, self.model_channels)
+        t_emb = self.time_embed(t_emb)
+
+        h = self.input_block(x)
+        res_hs = []
+
+        for i, enc_block in enumerate(self.enc_blocks):
+            h = enc_block(h, t_emb)
+            h = self.enc_attn[i](h)
+            res_hs.append(h)
+            if i < len(self.down_blocks):
+                h = self.down_blocks[i](h)
+
+        if self.has_mid_block:
+            h = self.mid_res1(h, t_emb)
+            h = self.mid_attn(h)
+            h = self.mid_res2(h, t_emb)
+
+        i = len(self.dec_blocks) - 1
+        while i >= 0:
+            if i < len(self.dec_blocks) - 1:
+                h = self.up_blocks[i + 1](h)
+                h_in = torch.cat([h, res_hs[i]], dim=1)
+            else:
+                h_in = h
+            h = self.dec_blocks[i](h_in, t_emb)
+            h = self.dec_attn[i](h)
+            i -= 1
+
+        h = self.up_blocks[0](h)
+        y = self.output_block(h)
+        return y
+register_type("UNetTd", UNetTd)
 
 
 #
