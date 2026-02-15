@@ -53,7 +53,13 @@ The model can operate in two modes:
 
 ## Training Procedure
 
-Training happens in two phases:
+Training happens in three phases:
+
+### Phase 0: Codec Network Training
+
+To enable working in a latent space, a VAE can be trained on the combined dataset of both domains. This is optional but can improve efficiency and quality by reducing dimensionality and focusing on perceptually relevant features.
+
+VAEs are supported along with Identity codecs that do nothing (pixel space).
 
 ### Phase 1: Saliency Network Training
 

@@ -130,59 +130,22 @@ rfpix2pix/
 
 ## Configuration
 
-Models are configured via JSON files. Example (`configs/small.json`):
-
-```json
-{
-    "type": "RFPix2pixModel",
-    "max_size": 128,
-    "sample_batch_size": 8,
-    "train_batch_size": 48,
-    "train_minibatch_size": 24,
-    "train_images": 6000000,
-    "learning_rate": 0.0002,
-    "num_inference_steps": 12,
-    "timestep_sampling": "logit-normal",
-    "saliency_learning_rate": 0.00005,
-    "saliency_accuracy_threshold": 0.995,
-    "saliency_warmup_threshold": 0.90,
-    "saliency_blend_fraction": 0.0,
-    "saliency_label_smoothing": 0.1,
-    "saliency_augmentations": ["color_jitter", "grayscale", "hflip", "random_erasing"],
-    "structure_pairing": false,
-    "structure_candidates": 8,
-    "velocity_net": {
-        "type": "UNet",
-        "model_channels": 128,
-        "ch_mult": [1, 2, 4, 8, 8],
-        "normalization": "GroupNorm32",
-        "activation": "SiLU",
-        "num_res_blocks": 2,
-        "zero_res_blocks": false,
-        "attention_resolutions": [],
-        "num_attention_heads": 8
-    },
-    "saliency_net": {
-        "type": "ResNetSaliencyNet",
-        "backbone": "resnet50",
-        "num_classes": 2,
-        "pretrained": true,
-        "latent_channels": 512
-    }
-}
-```
+Models are configured via JSON files. Example [configs/small.json](configs/small.json):
 
 ## Training Phases
 
 **Image Translation Mode:**
 
-1. **Phase 1: Saliency Training**  
+1. **Phase 0: Codec Training** (optional)  
+   Trains a VAE to encode images into a latent space. This can improve efficiency and quality by reducing dimensionality and focusing on perceptually relevant features.
+
+2. **Phase 1: Saliency Training**  
    Trains the classifier to distinguish domain 0 from domain 1 until it reaches the accuracy threshold.
 
-2. **Phase 1.5: Structure Embedding** (if `structure_pairing` is enabled)  
+3. **Phase 1.5: Structure Embedding** (if `structure_pairing` is enabled)  
    Computes DINOv2 embeddings for all images in both domains. Embeddings are cached globally in `~/.cache/rfpix2pix/` to avoid recomputation across runs.
 
-3. **Phase 2: Velocity Training**  
+4. **Phase 2: Velocity Training**  
    Freezes the saliency network and trains the velocity field using the saliency-weighted loss. If structure pairing is enabled, domain-1 images are selected from the top `structure_candidates` most structurally similar images for each domain-0 sample.
 
 **Generative Mode:**

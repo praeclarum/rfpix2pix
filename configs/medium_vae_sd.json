@@ -73,8 +73,7 @@
             "num_attention_heads": 8,
             "downsample": "StridedConv",
             "upsample": "NearestConv",
-            "mid_attention": true,
-            "time_conditioning": "FiLM"
+            "mid_attention": true
         },
         "sample_batch_size": 8,
         "train_batch_size": 64,
