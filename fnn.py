@@ -970,7 +970,7 @@ register_type("VAE", VAE)
 #
 # 3D BLOCKS (for temporal models)
 #
-class ResBlock3D(nn.Module):
+class ResBlock3d(nn.Module):
     """3D ResBlock with Conv3d. Mirrors ResBlock but with temporal dimension."""
     def __init__(
         self,
@@ -1008,7 +1008,7 @@ class ResBlock3D(nn.Module):
         h = self.out_layers(h)
         skip = self.skip_connection(x)
         return skip + h
-register_type("ResBlock3D", ResBlock3D)
+register_type("ResBlock3d", ResBlock3d)
 
 
 def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch.Tensor:
@@ -1033,7 +1033,7 @@ def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch
     return emb
 
 
-class UNet3D(nn.Module):
+class UNet3d(nn.Module):
     """
     3D UNet for temporal sequence generation.
     Downsamples spatially only, preserves temporal dimension.
@@ -1076,9 +1076,9 @@ class UNet3D(nn.Module):
         ch = model_channels
 
         def res_block(in_ch: int, out_ch: int):
-            blocks = [ResBlock3D(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)]
+            blocks = [ResBlock3d(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)]
             for _ in range(num_res_blocks - 1):
-                blocks.append(ResBlock3D(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks))
+                blocks.append(ResBlock3d(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks))
             return nn.Sequential(*blocks)
 
         for i, ch_m in enumerate(ch_mult):
@@ -1165,7 +1165,7 @@ class UNet3D(nn.Module):
 
         y = self.output_block(h)
         return y
-register_type("UNet3D", UNet3D)
+register_type("UNet3d", UNet3d)
 
 
 #
