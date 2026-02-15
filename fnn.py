@@ -129,7 +129,29 @@ def zero_module(module: nn.Module, should_zero: bool = True):
             p.detach().zero_()
     return module
 
-class ResBlock(nn.Module):
+class TimestepBlock(nn.Module):
+    """Marker base class for modules that accept `(x, t_emb)` in forward."""
+
+    def forward(self, x, t_emb):
+        raise NotImplementedError()
+
+class TimestepSequential(nn.Sequential):
+    """
+    Sequential container that forwards timestep embeddings only to layers
+    that support it (instances of `TimestepBlock`).
+    """
+
+    def forward(self, input, t_emb=None):
+        x = input
+        for layer in self:
+            if isinstance(layer, TimestepBlock):
+                x = layer(x, t_emb)
+            else:
+                x = layer(x)
+        return x
+
+
+class ResBlock(TimestepBlock):
     """Residual block with optional FiLM time conditioning.
 
     - If `time_embed_dim > 0`, `forward(x, t_emb)` applies FiLM modulation.
@@ -154,29 +176,17 @@ class ResBlock(nn.Module):
             get_activation(activation),
             nn.Conv2d(in_channels, out_channels, kernel_size=input_kernel_size, padding=input_kernel_size//2),
         )
+        self.out_norm = get_normalization(normalization, out_channels)
+        self.out_act = get_activation(activation)
+        self.out_conv = zero_module(
+            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2),
+            should_zero=zero_out,
+        )
         if time_embed_dim > 0:
-            # FiLM mode: store norm/act/conv separately so we can inject
-            # scale+shift between the norm and activation.
-            self.out_norm = get_normalization(normalization, out_channels)
-            self.out_act = get_activation(activation)
-            self.out_conv = zero_module(
-                nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2),
-                should_zero=zero_out,
-            )
             # Project time embedding to per-channel scale and shift
             self.time_proj = nn.Sequential(
                 nn.SiLU(),
                 nn.Linear(time_embed_dim, 2 * out_channels),
-            )
-        else:
-            # Default mode: plain sequential (no time conditioning)
-            self.out_layers = nn.Sequential(
-                get_normalization(normalization, out_channels),
-                get_activation(activation),
-                zero_module(
-                    nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2),
-                    should_zero=zero_out,
-                ),
             )
         if out_channels == in_channels:
             self.skip_connection = nn.Identity()
@@ -185,31 +195,16 @@ class ResBlock(nn.Module):
 
     def forward(self, x, t_emb=None):
         h = self.in_layers(x)
+        h = self.out_norm(h)
         if self.time_embed_dim > 0 and t_emb is not None:
             # FiLM: modulate the norm output with learned scale + shift
-            h = self.out_norm(h)
             scale_shift = self.time_proj(t_emb)  # (B, 2*C)
             scale, shift = scale_shift.chunk(2, dim=1)
             h = h * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
-            h = self.out_act(h)
-            h = self.out_conv(h)
-        else:
-            h = self.out_layers(h)
+        h = self.out_act(h)
+        h = self.out_conv(h)
         return self.skip_connection(x) + h
 register_type("ResBlock", ResBlock)
-
-
-class ResBlockSequence(nn.Module):
-    """A sequence of ResBlocks that forwards optional `t_emb` to each block."""
-
-    def __init__(self, blocks: list[ResBlock]):
-        super().__init__()
-        self.blocks = nn.ModuleList(blocks)
-
-    def forward(self, x, t_emb=None):
-        for block in self.blocks:
-            x = block(x, t_emb)
-        return x
 
 
 class SelfAttention2d(nn.Module):
@@ -311,7 +306,7 @@ class UNet(nn.Module):
             blocks = [ResBlock(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim)]
             for _ in range(num_res_blocks - 1):
                 blocks.append(ResBlock(out_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks, time_embed_dim=film_dim))
-            return ResBlockSequence(blocks)
+            return TimestepSequential(*blocks)
         def res_block_plain(in_ch, out_ch):
             """Unconditional ResBlock stack (no time conditioning)."""
             blocks = [ResBlock(in_ch, out_ch, normalization=normalization, activation=activation, zero_out=zero_res_blocks)]
