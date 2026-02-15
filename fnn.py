@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, cast
 import os
 import json
 import math
@@ -1682,6 +1682,7 @@ register_type("UNetTd", UNetTd)
 # LOSS
 #
 class L1Loss(nn.Module):
+    kind = "reconstruction"
     def __init__(self, id: str="l1_loss", weight: float=1.0):
         super().__init__()
         self.id = id
@@ -1692,6 +1693,7 @@ register_type("L1Loss", L1Loss)
 
 
 class MSELoss(nn.Module):
+    kind = "reconstruction"
     def __init__(self, id: str="mse_loss", weight: float=1.0):
         super().__init__()
         self.id = id
@@ -1717,6 +1719,66 @@ class KLLoss(nn.Module):
 register_type("KLLoss", KLLoss)
 
 
+_LPIPS_BACKBONE_CACHE: Dict[tuple[str, str], tuple[nn.Sequential, tuple[int, ...]]] = {}
+
+def _get_lpips_backbone(backbone: str, device: torch.device) -> tuple[nn.Sequential, tuple[int, ...]]:
+    """Get (or lazily create) a frozen LPIPS feature backbone for (backbone, device)."""
+    key = (backbone, str(device))
+    model_and_feature_indices = _LPIPS_BACKBONE_CACHE.get(key)
+    if model_and_feature_indices is None:
+        if backbone == "vgg16":
+            from torchvision.models import vgg16, VGG16_Weights
+            model = cast(nn.Sequential, vgg16(weights=VGG16_Weights.DEFAULT).features.to(device))
+            feature_indices = (3, 8, 15, 22)  # conv1_2, conv2_2, conv3_3, conv4_3 feature map indices
+        else:
+            raise ValueError(f"Unsupported LPIPS backbone: {backbone}")
+        model.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        model_and_feature_indices = (model, feature_indices)
+        _LPIPS_BACKBONE_CACHE[key] = model_and_feature_indices
+    return model_and_feature_indices
+
+def _extract_lpips_features(
+    x: torch.Tensor,
+    model_and_feature_indices: tuple[nn.Sequential, tuple[int, ...]],
+) -> list[torch.Tensor]:
+    """Extract LPIPS feature maps from a configured backbone."""
+    model, feature_indices = model_and_feature_indices
+    features = []
+    h = x
+    last_idx = feature_indices[-1]
+    for i, layer in enumerate(model.children()):
+        h = layer(h)
+        if i in feature_indices:
+            features.append(h)
+        if i >= last_idx:
+            break
+    return features
+
+def lpips_loss(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    backbone: str = "vgg16",
+) -> torch.Tensor:
+    """
+    Functional LPIPS-style perceptual loss.
+
+    Args:
+        input: (B, 3, H, W) reconstructed images in [-1, 1]
+        target: (B, 3, H, W) target images in [-1, 1]
+        backbone: Feature backbone name (currently supports "vgg16")
+    """
+    inp_01 = (input + 1.0) * 0.5
+    tgt_01 = (target + 1.0) * 0.5
+    model_and_feature_indices = _get_lpips_backbone(backbone, input.device)
+    feats_inp = _extract_lpips_features(inp_01, model_and_feature_indices)
+    feats_tgt = _extract_lpips_features(tgt_01, model_and_feature_indices)
+    loss = torch.tensor(0.0, device=input.device, dtype=input.dtype)
+    for fi, ft in zip(feats_inp, feats_tgt):
+        loss = loss + F.l1_loss(fi, ft)
+    return loss
+
 class LPIPSLoss(nn.Module):
     """
     Learned Perceptual Image Patch Similarity using VGG16 features.
@@ -1726,72 +1788,22 @@ class LPIPSLoss(nn.Module):
     The VGG backbone is always frozen.
     """
     kind = "reconstruction"
-    def __init__(self, id: str = "lpips_loss", weight: float = 1.0):
+    def __init__(
+        self,
+        id: str = "lpips_loss",
+        weight: float = 1.0,
+        backbone: str = "vgg16",
+    ):
         super().__init__()
         self.id = id
         self.weight = weight
-        self._vgg: Optional[nn.Module] = None
-        self._feature_layers: list[str] = []
-        # Lazily initialized to avoid loading VGG at config parse time
-
-    def _ensure_vgg(self, device: torch.device):
-        if self._vgg is not None:
-            return
-        from torchvision.models import vgg16, VGG16_Weights
-        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features.to(device)
-        vgg.eval()
-        for p in vgg.parameters():
-            p.requires_grad = False
-        self._vgg = vgg
-        # Feature extraction points (after ReLU):
-        # relu1_2 = layer 3, relu2_2 = layer 8, relu3_3 = layer 15, relu4_3 = layer 22
-        self._feature_indices = [3, 8, 15, 22]
-
-    def _extract_features(self, x: torch.Tensor) -> list[torch.Tensor]:
-        """Extract multi-scale VGG features from images in [0, 1]."""
-        features = []
-        h = x
-        for i, layer in enumerate(self._vgg):  # type: ignore
-            h = layer(h)
-            if i in self._feature_indices:
-                features.append(h)
-            if i >= self._feature_indices[-1]:
-                break
-        return features
+        self.backbone = backbone
 
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Compute perceptual loss.
-        
-        Args:
-            input: (B, 3, H, W) reconstructed images in [-1, 1]
-            target: (B, 3, H, W) original images in [-1, 1]
-        """
-        self._ensure_vgg(input.device)
-        # Convert [-1, 1] -> [0, 1]
-        inp_01 = (input + 1.0) * 0.5
-        tgt_01 = (target + 1.0) * 0.5
-        # Extract features and compute L1 distance per layer
-        feats_inp = self._extract_features(inp_01)
-        feats_tgt = self._extract_features(tgt_01)
-        loss = torch.tensor(0.0, device=input.device, dtype=input.dtype)
-        for fi, ft in zip(feats_inp, feats_tgt):
-            loss = loss + F.l1_loss(fi, ft)
-        return loss
-
-    def state_dict(self, *args, **kwargs):
-        """
-        Exclude VGG weights from state_dict.
-        
-        VGG is frozen and lazily loaded from torchvision,
-        so we don't need to save its weights.
-        """
-        full_state = super().state_dict(*args, **kwargs)
-        # Filter out _vgg weights
-        filtered_state = {
-            k: v for k, v in full_state.items()
-            if not k.startswith("_vgg.")
-        }
-        return filtered_state
+        return lpips_loss(
+            input,
+            target,
+            backbone=self.backbone,
+        )
 
 register_type("LPIPSLoss", LPIPSLoss)
