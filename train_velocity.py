@@ -356,7 +356,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     if velocity.gradient_clip > 0:
         print(f"{C.BRIGHT_CYAN}  Gradient clip:{C.RESET}  {velocity.gradient_clip}")
     if ema_tracker is not None:
-        print(f"{C.BRIGHT_CYAN}  EMA decay:{C.RESET}     {velocity.ema}")
+        print(f"{C.BRIGHT_CYAN}  EMA decay:{C.RESET}      {velocity.ema}")
     print()
 
     sample_minutes = 1
@@ -436,6 +436,11 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             save(step)
             last_save_time = datetime.datetime.now()
 
-    # Final save
+    # Final save (real weights for potential resume)
     save(last_step)
+    # Save EMA weights as the final inference checkpoint
+    if ema_tracker is not None:
+        with ema_tracker.swap(velocity.net):
+            save_module(velocity, os.path.join(run_dir, f"velocity_{run_id}_final_ema.ckpt"))
+        print(f"{C.GREEN}✓ Saved EMA weights to velocity_{run_id}_final_ema.ckpt{C.RESET}")
     print(f"\n{C.BOLD}{C.BRIGHT_GREEN}✓ Velocity training complete{C.RESET} at step {C.CYAN}{last_step}{C.RESET}\n")
