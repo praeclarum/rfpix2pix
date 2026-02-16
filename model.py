@@ -130,6 +130,10 @@ class Velocity(nn.Module):
             "train_minibatch_size": 24,
             "train_images": 6000000,
             "learning_rate": 0.0002,
+            "lr_schedule": "cosine",
+            "warmup_images": 500000,
+            "gradient_clip": 1.0,
+            "ema": 0.9999,
             "num_inference_steps": 12,
             "timestep_sampling": "logit-normal",
             "sample_batch_size": 8,
@@ -152,6 +156,10 @@ class Velocity(nn.Module):
         structure_pairing: bool = False,
         structure_candidates: int = 8,
         bf16: bool = False,
+        lr_schedule: str = "constant",
+        warmup_images: int = 0,
+        gradient_clip: float = 0.0,
+        ema: float = 0.0,
     ):
         super().__init__()
         self.net = object_from_config(
@@ -163,6 +171,10 @@ class Velocity(nn.Module):
         self.train_minibatch_size = train_minibatch_size
         self.train_images = train_images
         self.learning_rate = learning_rate
+        self.lr_schedule = lr_schedule
+        self.warmup_images = warmup_images
+        self.gradient_clip = gradient_clip
+        self.ema = ema
         self.num_inference_steps = num_inference_steps
         self.timestep_sampling = timestep_sampling
         self.sample_batch_size = sample_batch_size

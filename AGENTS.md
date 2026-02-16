@@ -91,6 +91,12 @@ Once the saliency network is trained, it is frozen and the velocity network is t
 
 where `J_h` is the Jacobian of the saliency network's `get_latent()` function, computed via JVP (Jacobian-vector product).
 
+**Learning Rate Schedule** (optional): Set `lr_schedule: "cosine"` for cosine decay from `learning_rate` to 0 over the training run. Set `warmup_images` (default: 0) to linearly ramp LR from 0 to `learning_rate` over that many images before the cosine decay begins. Default schedule is `"constant"`.
+
+**Gradient Clipping** (optional): Set `gradient_clip` to a positive value (e.g., 1.0) to clip the total gradient norm after accumulation and before the optimizer step. Prevents rare large-gradient spikes from corrupting learned features.
+
+**Exponential Moving Average** (optional): Set `ema` to a decay value (e.g., 0.9999) to maintain a shadow copy of model weights. After each optimizer step, shadow weights are updated: `shadow = decay * shadow + (1 - decay) * model`. Samples are generated using EMA weights, which are smoother and produce higher quality than raw training weights. EMA state is saved to `runs/<run_id>/ema_state.pt` and automatically restored on resume.
+
 **Structure-Aware Pairing** (optional): Set `structure_pairing: true` to enable intelligent image pairing during velocity training. Instead of random cross-domain pairing, this uses DINOv2 embeddings to find structurally similar images across domains. This helps when domains have diverse compositions (close-ups vs wide shots, different scenes) by matching images with similar layout/pose.
 
 - Embeddings are cached globally in `~/.cache/rfpix2pix/dino_embeddings.db` (SQLite)
