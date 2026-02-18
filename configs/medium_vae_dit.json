@@ -55,26 +55,12 @@
     "velocity": {
         "type": "Velocity",
         "net": {
-            "type": "UNet",
-            "model_channels": 192,
-            "ch_mult": [
-                1,
-                2,
-                4
-            ],
-            "normalization": "GroupNorm32",
-            "activation": "SiLU",
-            "num_res_blocks": 2,
-            "zero_res_blocks": false,
-            "attention_resolutions": [
-                0,
-                1,
-                2
-            ],
-            "num_attention_heads": 8,
-            "downsample": "StridedConv",
-            "upsample": "NearestConv",
-            "mid_attention": true
+            "type": "DiT",
+            "patch_size": 2,
+            "hidden_size": 768,
+            "depth": 12,
+            "num_heads": 12,
+            "mlp_ratio": 4.0
         },
         "sample_batch_size": 8,
         "train_batch_size": 64,
