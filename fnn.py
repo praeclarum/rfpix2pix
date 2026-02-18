@@ -788,22 +788,6 @@ class CodecNet(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
 
-    def freeze_backbone(self):
-        """Override in nets with pretrained backbones."""
-        pass
-
-    def unfreeze_backbone(self):
-        """Override in nets with pretrained backbones."""
-        pass
-
-    def has_backbone(self) -> bool:
-        """Return True if this net has a pretrained backbone that supports warmup."""
-        return False
-
-    def get_optimizer_param_groups(self, lr: float, backbone_frozen: bool) -> list:
-        """Get parameter groups for optimizer. Override for differential LR."""
-        return [{"params": self.parameters(), "lr": lr}]
-
 
 class Identity(CodecNet):
     """Pass-through: no encoding/decoding. latent_channels=3, spatial_factor=1."""

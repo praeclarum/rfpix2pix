@@ -14,6 +14,7 @@ from PIL import Image
 from fnn import save_module, device
 from data import RFPix2pixDataset
 from model import RFPix2pixModel
+from codec import Codec
 from utils import Colors as C, AccuracyTracker
 
 CODEC_STATE_FILE = "codec_state.json"
@@ -25,7 +26,6 @@ def read_codec_state(run_dir: str) -> dict:
     default_state = {
         "trained": False,
         "loss": None,
-        "backbone_warmed_up": False,
     }
     if not os.path.exists(state_path):
         return default_state
@@ -40,7 +40,7 @@ def read_codec_state(run_dir: str) -> dict:
         return default_state
 
 
-def write_codec_state(run_dir: str, trained: bool | None = None, loss: float | None = None, backbone_warmed_up: bool | None = None):
+def write_codec_state(run_dir: str, trained: bool | None = None, loss: float | None = None):
     """Update the codec training state file."""
     state = read_codec_state(run_dir)
     if trained is not None:
@@ -48,8 +48,6 @@ def write_codec_state(run_dir: str, trained: bool | None = None, loss: float | N
     if loss is not None:
         state["loss"] = loss
         print(f"{C.DIM}Saved codec loss: {C.CYAN}{loss:.6f}{C.RESET}")
-    if backbone_warmed_up is not None:
-        state["backbone_warmed_up"] = backbone_warmed_up
     state_path = os.path.join(run_dir, CODEC_STATE_FILE)
     with open(state_path, "w") as f:
         json.dump(state, f, indent=2)
@@ -81,33 +79,15 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     rf_model.eval_saliency()
     rf_model.to(device)
 
-    codec = rf_model.codec
+    codec: Codec = rf_model.codec
     lr = codec.learning_rate
-    batch_size = codec.train_batch_size if codec.train_batch_size is not None else 48
+    batch_size = codec.train_batch_size if codec.train_batch_size is not None else 64
     minibatch_size = codec.train_minibatch_size if codec.train_minibatch_size is not None else batch_size
 
     num_steps = codec.train_images // batch_size
     last_step = num_steps
 
-    # Check if backbone warmup was already completed (resuming)
-    codec_state = read_codec_state(run_dir)
-    backbone_already_warmed = codec_state["backbone_warmed_up"]
-
-    def create_optimizer(backbone_frozen: bool) -> torch.optim.AdamW:
-        param_groups = codec.get_optimizer_param_groups(lr, backbone_frozen)
-        return torch.optim.AdamW(param_groups, betas=(0.9, 0.999), weight_decay=1e-4)
-
-    has_backbone = codec.has_backbone()
-    if has_backbone and not backbone_already_warmed:
-        codec.freeze_backbone()
-        backbone_frozen = True
-    elif has_backbone and backbone_already_warmed:
-        codec.unfreeze_backbone()
-        backbone_frozen = False
-    else:
-        backbone_frozen = False
-
-    optimizer = create_optimizer(backbone_frozen)
+    optimizer = torch.optim.AdamW(codec.parameters(), betas=(0.9, 0.999), weight_decay=1e-4)
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=minibatch_size, shuffle=True, num_workers=8
@@ -138,8 +118,6 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     print(f"{C.BRIGHT_CYAN}  Losses:{C.RESET}         {', '.join(l.id for l in codec.loss_fns)}") # type: ignore
     if codec.augmentations:
         print(f"{C.BRIGHT_CYAN}  Augmentations:{C.RESET}  {', '.join(codec.augmentations)}")
-    if has_backbone:
-        print(f"{C.BRIGHT_CYAN}  Backbone frozen:{C.RESET} {C.YELLOW if backbone_frozen else C.GREEN}{backbone_frozen}{C.RESET}")
     print()
 
     # Generate augmentation grid at start of training for visual verification
@@ -196,8 +174,11 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
                 if k not in ("loss", "x_hat"):
                     loss_details[k] = loss_details.get(k, 0.0) + v * grad_scale
 
+        # Gradient clipping (after all accumulation, before optimizer step)
+        if codec.gradient_clip > 0:
+            torch.nn.utils.clip_grad_norm_(codec.parameters(), max_norm=codec.gradient_clip)
+
         optimizer.step()
-        gc.collect()
 
         latest_loss = loss_item
         loss_tracker.update(loss_item)
@@ -213,27 +194,14 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
                 wlog[f"codec_{k}"] = v
             wandb_run.log(wlog)
 
-        if (datetime.datetime.now() - last_sample_time).total_seconds() >= sample_minutes * 60:
+        if (step == 0) or (datetime.datetime.now() - last_sample_time).total_seconds() >= sample_minutes * 60:
             sample_codec_reconstruction(rf_model, dataset, run_dir, label=f"step_{step:06d}", wandb_run=wandb_run)
             rf_model.train_codec()
             sample_minutes = min(sample_minutes * 2, max_sample_minutes)
             last_sample_time = datetime.datetime.now()
 
-        if (datetime.datetime.now() - last_save_time).total_seconds() >= save_minutes * 60:
+        if (step == 0) or (datetime.datetime.now() - last_save_time).total_seconds() >= save_minutes * 60:
             save(step)
-
-        # Backbone warmup transition (if applicable)
-        if has_backbone and backbone_frozen and codec.warmup_threshold is not None:
-            if loss_tracker.is_stable and loss_tracker.smoothed < codec.warmup_threshold:
-                print(f"\n{C.BOLD}{C.GREEN}✓ Codec backbone warmup complete{C.RESET} at step {C.CYAN}{step}{C.RESET}")
-                codec.unfreeze_backbone()
-                optimizer = create_optimizer(backbone_frozen=False)
-                backbone_frozen = False
-                loss_tracker.reset()
-                save(step)
-                write_codec_state(run_dir, backbone_warmed_up=True)
-                if wandb_run is not None:
-                    wandb_run.log({"codec_backbone_unfrozen": 1, "codec_step": step})
 
     save(last_step)
     write_codec_state(run_dir, trained=True, loss=latest_loss)
@@ -260,20 +228,37 @@ def sample_codec_reconstruction(
     """Generate a grid showing [original | reconstructed] pairs for codec quality check."""
     rf_model.eval()
     rows = []
-    for i in range(num_samples):
-        inputs = dataset[random.randint(0, len(dataset) - 1)]
-        x = inputs["domain_1"].unsqueeze(0).to(device)  # (1, 3, H, W)
-        enc = rf_model.codec.net.encode_params(x)
-        z = enc["z"]  # (1, C, H', W')
-        x_hat = rf_model.codec.net.decode(z)
+    z_shape = None
+    def z2img(z: torch.Tensor) -> torch.Tensor:
+        nonlocal z_shape
+        if z_shape is None:
+            z_shape = z.shape
         # Visualize first 3 latent channels, scaled to [-1, 1]
         z_vis = z[:, :3, :, :]  # (1, 3, H', W')
         z_vis = (z_vis / 4.0).clamp(-1, 1)  # scale assuming ~N(0,1) latents
         z_vis = torch.nn.functional.interpolate(z_vis, size=x.shape[2:], mode="nearest")  # upscale
         z_vis = z_vis.clamp(-1, 1)
-        row = torch.cat([x, x_hat, z_vis], dim=3)  # (1, 3, H, 3W)
+        return z_vis
+    for i in range(num_samples):
+        row_images = []
+        for domain_index in range(2):
+            if domain_index == 0 and dataset.use_random_noise_domain0:
+                continue  # Skip random noise domain for reconstruction visualization
+            inputs = dataset[random.randint(0, len(dataset) - 1)]
+            x = inputs[f"domain_{domain_index}"].unsqueeze(0).to(device)  # (1, 3, H, W)
+            enc = rf_model.codec.net.encode_params(x)
+            z = enc["z"]  # (1, C, H', W')
+            x_hat = rf_model.codec.net.decode(z)
+            z_vis = z2img(z)
+            row_images.extend([x, x_hat, z_vis])
+        if z_shape is not None:
+            z = torch.randn(1, z_shape[1], z_shape[2], z_shape[3], device=device)
+            x_dec = rf_model.codec.net.decode(z)
+            z_vis = z2img(z)
+            row_images.extend([x_dec, z_vis])
+        row = torch.cat(row_images, dim=3)  # (1, 3, H, W*M)
         rows.append(row)
-    image = torch.cat(rows, dim=2)  # (1, 3, H*N, 2W)
+    image = torch.cat(rows, dim=2)  # (1, 3, H*N, W*M)
     image = (image.squeeze(0).cpu().numpy() + 1.0) * 127.5
     image = image.clip(0, 255).astype("uint8")
     image = Image.fromarray(image.transpose(1, 2, 0))

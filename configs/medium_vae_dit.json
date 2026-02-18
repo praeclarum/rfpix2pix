@@ -42,9 +42,10 @@
                 "weight": 1e-03
             }
         ],
+        "gradient_clip": 1.0,
         "learning_rate": 0.0001,
         "train_batch_size": 64,
-        "train_minibatch_size": 64,
+        "train_minibatch_size": 32,
         "train_images": 1000000,
         "sample_batch_size": 8,
         "augmentations": [

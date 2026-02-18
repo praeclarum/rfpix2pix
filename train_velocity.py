@@ -427,7 +427,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             }
             wandb_run.log(wlog)
 
-        if (datetime.datetime.now() - last_sample_time).total_seconds() >= sample_minutes * 60:
+        if (step == 0) or (datetime.datetime.now() - last_sample_time).total_seconds() >= sample_minutes * 60:
             sample(rf_model, dataset, run_dir, f"step_{step:06d}", ema=ema_tracker)
             sample_minutes = min(sample_minutes * 2, max_sample_minutes)
             last_sample_time = datetime.datetime.now()

@@ -45,6 +45,7 @@ class Codec(nn.Module):
         warmup_threshold: Optional[float] = None,
         sample_batch_size: int = 8,
         augmentations: list[str] = [],
+        gradient_clip: float = 1.0
     ):
         super().__init__()
         self.net: CodecNet = object_from_config(net)
@@ -57,6 +58,7 @@ class Codec(nn.Module):
         self.sample_batch_size = sample_batch_size
         self.augmentations = augmentations
         self.augment = ImageAugmentation(augmentations)
+        self.gradient_clip = gradient_clip
 
     @property
     def out_channels(self) -> int:
@@ -107,17 +109,5 @@ class Codec(nn.Module):
         result["x_hat"] = x_hat
         return result
 
-    def freeze_backbone(self):
-        self.net.freeze_backbone()
-
-    def unfreeze_backbone(self):
-        self.net.unfreeze_backbone()
-
-    def has_backbone(self) -> bool:
-        return self.net.has_backbone()
-
-    def get_optimizer_param_groups(self, lr: float, backbone_frozen: bool) -> list:
-        return self.net.get_optimizer_param_groups(lr, backbone_frozen)
 register_type("Codec", Codec)
-
 
