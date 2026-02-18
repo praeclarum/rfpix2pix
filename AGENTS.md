@@ -77,7 +77,7 @@ The saliency network `h(x)` is a domain classifier (e.g., ResNet-based) that lea
 
 This phase has two sub-phases for pretrained backbones:
 
-1. **Backbone Warmup** (frozen backbone): Train only the head layers (`latent_proj`, `classifier`) until accuracy reaches `saliency_warmup_threshold`. This prevents random gradients from corrupting pretrained weights.
+1. **Backbone Warmup** (frozen backbone): Train only the head layers (`latent_proj`, `classifier`) until accuracy reaches `saliency.warmup_threshold`. This prevents random gradients from corrupting pretrained weights.
 
 2. **Full Fine-tuning** (unfrozen backbone): Continue training the entire network until accuracy reaches `saliency_accuracy_threshold`.
 

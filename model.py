@@ -117,29 +117,7 @@ class Velocity(nn.Module):
     and inference parameters.
     
     The net config determines the actual velocity prediction architecture.
-    Training parameters control the velocity training phase.
-    
-    Properties:
-        num_downsamples: number of spatial downsampling levels (from net)
-    
-    Example config:
-        {
-            "type": "Velocity",
-            "net": {"type": "UNet", "model_channels": 96, "ch_mult": [1, 2, 4]},
-            "train_batch_size": 48,
-            "train_minibatch_size": 24,
-            "train_images": 6000000,
-            "learning_rate": 0.0002,
-            "lr_schedule": "cosine",
-            "warmup_images": 500000,
-            "gradient_clip": 1.0,
-            "ema": 0.9999,
-            "num_inference_steps": 12,
-            "timestep_sampling": "logit-normal",
-            "sample_batch_size": 8,
-            "structure_pairing": false,
-            "structure_candidates": 8
-        }
+    Training parameters control the velocity training phase.    
     """
     def __init__(
         self,
@@ -157,7 +135,7 @@ class Velocity(nn.Module):
         structure_candidates: int = 8,
         bf16: bool = False,
         lr_schedule: str = "constant",
-        warmup_images: int = 0,
+        warmup_fraction: float = 0.0,
         gradient_clip: float = 0.0,
         ema: float = 0.0,
     ):
@@ -172,7 +150,7 @@ class Velocity(nn.Module):
         self.train_images = train_images
         self.learning_rate = learning_rate
         self.lr_schedule = lr_schedule
-        self.warmup_images = warmup_images
+        self.warmup_fraction = warmup_fraction
         self.gradient_clip = gradient_clip
         self.ema = ema
         self.num_inference_steps = num_inference_steps

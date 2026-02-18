@@ -11,7 +11,7 @@ class Codec(nn.Module):
     
     The net config determines the actual encoder/decoder architecture.
     Losses define how the codec is trained (empty = no training needed).
-    Training parameters (learning_rate, train_images, warmup_threshold)
+    Training parameters (learning_rate, train_images, warmup_fraction, gradient_clip)
     control the codec training phase.
     
     Properties:
@@ -40,12 +40,13 @@ class Codec(nn.Module):
         losses: list[Config] = [],
         learning_rate: float = 1e-4,
         train_images: int = 0,
-        train_batch_size: Optional[int] = None,
+        train_batch_size: int = 64,
         train_minibatch_size: Optional[int] = None,
-        warmup_threshold: Optional[float] = None,
         sample_batch_size: int = 8,
         augmentations: list[str] = [],
-        gradient_clip: float = 1.0
+        gradient_clip: float = 1.0,
+        warmup_fraction: float = 0.0,
+        lr_schedule: str = "cosine",
     ):
         super().__init__()
         self.net: CodecNet = object_from_config(net)
@@ -53,12 +54,13 @@ class Codec(nn.Module):
         self.learning_rate = learning_rate
         self.train_images = train_images
         self.train_batch_size = train_batch_size
-        self.train_minibatch_size = train_minibatch_size
-        self.warmup_threshold = warmup_threshold
+        self.train_minibatch_size = train_minibatch_size if train_minibatch_size is not None else train_batch_size
         self.sample_batch_size = sample_batch_size
         self.augmentations = augmentations
         self.augment = ImageAugmentation(augmentations)
         self.gradient_clip = gradient_clip
+        self.warmup_fraction = warmup_fraction
+        self.lr_schedule = lr_schedule
 
     @property
     def out_channels(self) -> int:

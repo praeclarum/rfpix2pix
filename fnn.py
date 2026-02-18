@@ -6,6 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import contextmanager
 
 
 #
@@ -59,7 +60,7 @@ def save_module(obj: nn.Module, filename: str):
         "state_dict": obj.state_dict(),
     }
     torch.save(out_dict, filename)
-def load_module(filename: str, strict: bool = False, **kwargs) -> nn.Module:
+def load_module(filename: str, strict: bool = True, **kwargs) -> nn.Module:
     # Load to CPU first for cross-device compatibility (CUDA -> MPS, etc.)
     in_dict = torch.load(filename, map_location="cpu", weights_only=False)
     obj = object_from_config(in_dict["config"], **kwargs)
@@ -1791,3 +1792,71 @@ class LPIPSLoss(nn.Module):
         )
 
 register_type("LPIPSLoss", LPIPSLoss)
+
+
+#
+# TRAINING UTILITIES
+#
+
+def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, schedule: str) -> float:
+    """Compute learning rate for a given step with warmup + schedule."""
+    if step < warmup_steps:
+        # Linear warmup
+        return max_lr * (step + 1) / warmup_steps
+    if schedule == "constant":
+        return max_lr
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    if schedule == "cosine":
+        # Cosine decay from max_lr -> 0 over remaining steps
+        return max_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    raise ValueError(f"Unsupported LR schedule: {schedule}")
+
+
+class EMA:
+    """
+    Exponential Moving Average of model parameters.
+    
+    Maintains a shadow copy of weights on CPU to save GPU memory.
+    Only moves to GPU when swapping in for sampling.
+    """
+    def __init__(self, model: torch.nn.Module, decay: float):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().cpu()
+    
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        """Update shadow weights: shadow = decay * shadow + (1 - decay) * param."""
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                # Move shadow to device, update in-place, move back to CPU
+                self.shadow[name].lerp_(param.data.cpu(), 1.0 - self.decay)
+    
+    @contextmanager
+    def swap(self, model: torch.nn.Module):
+        """
+        Context manager: temporarily swap EMA weights into the model for inference.
+        Restores training weights on exit.
+        """
+        backup: dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name].to(param.device))
+        try:
+            yield
+        finally:
+            for name, param in model.named_parameters():
+                if name in backup:
+                    param.data.copy_(backup[name])
+    
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return self.shadow.copy()
+    
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor]):
+        for name in self.shadow:
+            if name in state_dict:
+                self.shadow[name] = state_dict[name].cpu()
+

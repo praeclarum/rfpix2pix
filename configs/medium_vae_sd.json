@@ -82,7 +82,7 @@
         "train_images": 30000000,
         "learning_rate": 0.0002,
         "lr_schedule": "cosine",
-        "warmup_images": 500000,
+        "warmup_fraction": 0.015,
         "gradient_clip": 1.0,
         "ema": 0.9999,
         "num_inference_steps": 12,

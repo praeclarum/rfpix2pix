@@ -11,7 +11,7 @@ import wandb
 import wandb.wandb_run
 from PIL import Image
 
-from fnn import save_module, device
+from fnn import save_module, device, get_lr
 from data import RFPix2pixDataset
 from model import RFPix2pixModel
 from codec import Codec
@@ -80,14 +80,22 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     rf_model.to(device)
 
     codec: Codec = rf_model.codec
-    lr = codec.learning_rate
     batch_size = codec.train_batch_size if codec.train_batch_size is not None else 64
     minibatch_size = codec.train_minibatch_size if codec.train_minibatch_size is not None else batch_size
 
     num_steps = codec.train_images // batch_size
     last_step = num_steps
 
-    optimizer = torch.optim.AdamW(codec.parameters(), betas=(0.9, 0.999), weight_decay=1e-4)
+    max_lr = codec.learning_rate
+    warmup_images = int(codec.warmup_fraction * codec.train_images)
+    warmup_steps = warmup_images // codec.train_batch_size
+
+    optimizer = torch.optim.AdamW(
+        codec.net.parameters(),
+        lr=max_lr,
+        betas=(0.9, 0.999),
+        weight_decay=1e-4
+    )
 
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=minibatch_size, shuffle=True, num_workers=8
@@ -110,11 +118,17 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     grad_scale = 1.0 / num_grad_acc_steps
 
     print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Codec ━━━{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Images:{C.RESET}         {C.BOLD}{codec.train_images}{C.RESET}")
     print(f"{C.BRIGHT_CYAN}  Steps:{C.RESET}          {C.BOLD}{num_steps}{C.RESET}")
     print(f"{C.BRIGHT_CYAN}  Batch size:{C.RESET}     {batch_size}")
     print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {minibatch_size}")
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
-    print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {lr}")
+    print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {max_lr}")
+    print(f"{C.BRIGHT_CYAN}  LR schedule:{C.RESET}    {codec.lr_schedule}" + (f" (warmup: {warmup_steps} steps / {warmup_images} images)" if warmup_steps > 0 else ""))
+    if codec.gradient_clip > 0:
+        print(f"{C.BRIGHT_CYAN}  Gradient clip:{C.RESET}  {codec.gradient_clip}")
+    # if ema_tracker is not None:
+    #     print(f"{C.BRIGHT_CYAN}  EMA decay:{C.RESET}      {velocity.ema}")
     print(f"{C.BRIGHT_CYAN}  Losses:{C.RESET}         {', '.join(l.id for l in codec.loss_fns)}") # type: ignore
     if codec.augmentations:
         print(f"{C.BRIGHT_CYAN}  Augmentations:{C.RESET}  {', '.join(codec.augmentations)}")
@@ -124,7 +138,7 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
     if codec.augmentations:
         sample_codec_augmentations(rf_model, dataset, run_dir, wandb_run=wandb_run)
 
-    save_minutes = 30
+    save_minutes = 120
     last_save_time = datetime.datetime.now()
 
     sample_minutes = 1
@@ -141,6 +155,11 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
 
     progress = tqdm(range(0, last_step), initial=0, total=last_step)
     for step in progress:
+        # Update learning rate
+        lr = get_lr(step, warmup_steps, num_steps, max_lr, codec.lr_schedule)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
         optimizer.zero_grad()
 
         loss_item = 0.0
@@ -186,6 +205,7 @@ def train_codec(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: st
         postfix = {"loss": f"{loss_item:.4f}"}
         for k, v in loss_details.items():
             postfix[k] = f"{v:.4f}"
+        postfix["lr"] = f"{lr:.2e}"
         progress.set_postfix(postfix)
 
         if wandb_run is not None:

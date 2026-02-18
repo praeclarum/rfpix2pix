@@ -4,7 +4,7 @@ import random
 import copy
 import datetime
 import os
-from contextlib import nullcontext, contextmanager
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -14,59 +14,10 @@ import wandb
 import wandb.wandb_run
 from PIL import Image
 
-from fnn import save_module, device
+from fnn import save_module, device, get_lr, EMA
 from data import RFPix2pixDataset, StructurePairing, load_media_item
 from model import RFPix2pixModel
 from utils import Colors as C
-
-
-class EMA:
-    """
-    Exponential Moving Average of model parameters.
-    
-    Maintains a shadow copy of weights on CPU to save GPU memory.
-    Only moves to GPU when swapping in for sampling.
-    """
-    def __init__(self, model: torch.nn.Module, decay: float):
-        self.decay = decay
-        self.shadow: dict[str, torch.Tensor] = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone().cpu()
-    
-    @torch.no_grad()
-    def update(self, model: torch.nn.Module):
-        """Update shadow weights: shadow = decay * shadow + (1 - decay) * param."""
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                # Move shadow to device, update in-place, move back to CPU
-                self.shadow[name].lerp_(param.data.cpu(), 1.0 - self.decay)
-    
-    @contextmanager
-    def swap(self, model: torch.nn.Module):
-        """
-        Context manager: temporarily swap EMA weights into the model for inference.
-        Restores training weights on exit.
-        """
-        backup: dict[str, torch.Tensor] = {}
-        for name, param in model.named_parameters():
-            if name in self.shadow:
-                backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name].to(param.device))
-        try:
-            yield
-        finally:
-            for name, param in model.named_parameters():
-                if name in backup:
-                    param.data.copy_(backup[name])
-    
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        return self.shadow.copy()
-    
-    def load_state_dict(self, state_dict: dict[str, torch.Tensor]):
-        for name in self.shadow:
-            if name in state_dict:
-                self.shadow[name] = state_dict[name].cpu()
 
 
 def compute_velocity_loss(
@@ -252,19 +203,6 @@ def sample_structure_pairings(
     print(f"{C.GREEN}✓ Saved structure pairing proof sheet to {C.BOLD}{path}{C.RESET}")
     print(f"  {C.DIM}Grid: {len(domain_0_indices)} rows × {k + 1} columns (source + {k} matches){C.RESET}\n")
 
-
-def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, schedule: str) -> float:
-    """Compute learning rate for a given step with warmup + schedule."""
-    if step < warmup_steps:
-        # Linear warmup
-        return max_lr * (step + 1) / warmup_steps
-    if schedule == "constant":
-        return max_lr
-    # Cosine decay from max_lr -> 0 over remaining steps
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return max_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
 def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir: str, step_start: int, dev: bool):
     """
     Train the velocity network using saliency-weighted flow matching loss.
@@ -273,7 +211,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     to predict the flow velocity in latent space.
     
     Supports:
-        - Cosine LR schedule with linear warmup (lr_schedule, warmup_images)
+        - Cosine LR schedule with linear warmup (lr_schedule, warmup_fraction)
         - Gradient norm clipping (gradient_clip)
         - Exponential Moving Average of weights for sampling (ema)
     
@@ -297,7 +235,8 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     last_step = step_start + num_steps
     
     max_lr = velocity.learning_rate
-    warmup_steps = velocity.warmup_images // velocity.train_batch_size
+    warmup_images = int(velocity.warmup_fraction * velocity.train_images)
+    warmup_steps = warmup_images // velocity.train_batch_size
     
     optimizer = torch.optim.AdamW(
         velocity.net.parameters(),
@@ -346,13 +285,14 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     grad_scale = 1.0 / num_grad_acc_steps
     
     print(f"\n{C.BOLD}{C.MAGENTA}━━━ Training Velocity Network ━━━{C.RESET}")
+    print(f"{C.BRIGHT_CYAN}  Images:{C.RESET}         {C.BOLD}{velocity.train_images}{C.RESET}")
     print(f"{C.BRIGHT_CYAN}  Steps:{C.RESET}          {C.BOLD}{num_steps}{C.RESET}")
     print(f"{C.BRIGHT_CYAN}  Starting step:{C.RESET}  {step_start}")
     print(f"{C.BRIGHT_CYAN}  Batch size:{C.RESET}     {velocity.train_batch_size}")
     print(f"{C.BRIGHT_CYAN}  Minibatch size:{C.RESET} {velocity.train_minibatch_size}")
     print(f"{C.BRIGHT_CYAN}  Grad acc steps:{C.RESET} {num_grad_acc_steps}")
     print(f"{C.BRIGHT_CYAN}  Learning rate:{C.RESET}  {max_lr}")
-    print(f"{C.BRIGHT_CYAN}  LR schedule:{C.RESET}    {velocity.lr_schedule}" + (f" (warmup: {warmup_steps} steps / {velocity.warmup_images} images)" if warmup_steps > 0 else ""))
+    print(f"{C.BRIGHT_CYAN}  LR schedule:{C.RESET}    {velocity.lr_schedule}" + (f" (warmup: {warmup_steps} steps / {warmup_images} images)" if warmup_steps > 0 else ""))
     if velocity.gradient_clip > 0:
         print(f"{C.BRIGHT_CYAN}  Gradient clip:{C.RESET}  {velocity.gradient_clip}")
     if ema_tracker is not None:
@@ -363,7 +303,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
     max_sample_minutes = 8
     last_sample_time = datetime.datetime.now()
 
-    save_minutes = 30
+    save_minutes = 120
     last_save_time = datetime.datetime.now()
 
     progress = tqdm(range(step_start, last_step), initial=step_start, total=last_step - step_start)
