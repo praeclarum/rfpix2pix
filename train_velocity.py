@@ -432,7 +432,7 @@ def train_velocity(rf_model: RFPix2pixModel, dataset: RFPix2pixDataset, run_dir:
             sample_minutes = min(sample_minutes * 2, max_sample_minutes)
             last_sample_time = datetime.datetime.now()
         
-        if (datetime.datetime.now() - last_save_time).total_seconds() >= save_minutes * 60:
+        if (step == 0) or (datetime.datetime.now() - last_save_time).total_seconds() >= save_minutes * 60:
             save(step)
             last_save_time = datetime.datetime.now()
 

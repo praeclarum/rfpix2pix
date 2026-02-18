@@ -67,6 +67,7 @@
             "num_res_blocks": 2,
             "zero_res_blocks": false,
             "attention_resolutions": [
+                0,
                 1,
                 2
             ],
