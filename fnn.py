@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional, Sequence, cast
 import os
 import json
 import math
@@ -769,9 +769,12 @@ class CodecNet(nn.Module):
     def spatial_factor(self) -> int:
         return self._spatial_factor
 
+    def sample_random_latent(self, shape: Sequence[int], device: torch.device) -> torch.Tensor:
+        return torch.randn(shape, device=device)
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode (B, 3, H, W) -> (B, latent_channels, H/sf, W/sf)"""
-        raise NotImplementedError()
+        return self.encode_params(x)["z"]
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode (B, latent_channels, H', W') -> (B, 3, H, W)"""
@@ -784,7 +787,7 @@ class CodecNet(nn.Module):
         For deterministic nets, returns {"z": z}.
         For VAE nets, returns {"z": z, "mu": mu, "logvar": logvar}.
         """
-        return {"z": self.encode(x)}
+        raise NotImplementedError()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(x))
@@ -795,8 +798,8 @@ class Identity(CodecNet):
     def __init__(self):
         super().__init__(latent_channels=3, spatial_factor=1)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+    def encode_params(self, x: torch.Tensor) -> dict:
+        return {"z": x}
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return z
@@ -970,11 +973,11 @@ class AutoEncoder(CodecNet):
         )
 
     def _encoder_out_channels(self, latent_channels: int) -> int:
-        """Number of channels the encoder should produce. Overridden by VAE."""
+        """Number of channels the encoder should produce."""
         return latent_channels
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+    def encode_params(self, x: torch.Tensor) -> dict:
+        return {"z": self.encoder(x)}
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.decoder(z)
@@ -1004,10 +1007,38 @@ class VAE(AutoEncoder):
         else:
             z = mu
         return {"z": z, "mu": mu, "logvar": logvar}
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encode_params(x)["z"]
 register_type("VAE", VAE)
+
+
+class SAE(AutoEncoder):
+    """
+    Spherical autoencoder.
+
+    Maps the latent space to a sphere.
+    """
+
+    def __init__(
+        self,
+        eps: float = 1e-8,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.eps = eps
+
+    def spherify(self, z: torch.Tensor) -> torch.Tensor:
+        """Project latent vectors onto a sphere."""
+        return z * torch.rsqrt(z.square().mean(dim=[1, 2, 3], keepdim=True) + self.eps)
+
+    def sample_random_latent(self, shape: Sequence[int], device: torch.device) -> torch.Tensor:
+        z = torch.randn(shape, device=device)
+        return self.spherify(z)
+
+    def encode_params(self, x: torch.Tensor) -> dict:
+        """Encode and return mu, logvar, and reparameterized sample z."""
+        z: torch.Tensor = self.encoder(x)  # (B, latent_channels, H', W')
+        z = self.spherify(z)  # project to sphere
+        return {"z": z}
+register_type("SAE", SAE)
 
 
 #

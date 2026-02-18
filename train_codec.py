@@ -272,7 +272,7 @@ def sample_codec_reconstruction(
             z_vis = z2img(z)
             row_images.extend([x, x_hat, z_vis])
         if z_shape is not None:
-            z = torch.randn(1, z_shape[1], z_shape[2], z_shape[3], device=device)
+            z = rf_model.codec.net.sample_random_latent(z_shape, device)
             x_dec = rf_model.codec.net.decode(z)
             z_vis = z2img(z)
             row_images.extend([x_dec, z_vis])
