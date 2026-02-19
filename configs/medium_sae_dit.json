@@ -54,7 +54,7 @@
         "warmup_fraction": 0.015,
         "learning_rate": 0.0001,
         "train_batch_size": 64,
-        "train_minibatch_size": 32,
+        "train_minibatch_size": 16,
         "train_images": 1000000,
         "sample_batch_size": 8,
         "augmentations": [

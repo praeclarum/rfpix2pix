@@ -99,12 +99,20 @@ class Codec(nn.Module):
         total_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         result: dict = {}
         for loss_fn in self.loss_fns:
-            if getattr(loss_fn, "kind", "reconstruction") == "regularization":
+            loss_kind = getattr(loss_fn, "kind", "reconstruction")
+            if loss_kind == "regularization":
                 # Regularization loss (e.g., KL): pass distribution params
-                val = loss_fn(params["mu"], params["logvar"])
+                val = loss_fn(mu=params["mu"], logvar=params["logvar"])
+            elif loss_kind == "sae":
+                # SAE losses
+                x_hat_noisy_big = self.net.decode(params["v_noisy_big"])
+                v_x_hat_noisy_big = self.net.encoder(x_hat_noisy_big) # type: ignore
+                val = loss_fn(
+                    x_hat_noisy_small=x_hat, x_hat_noisy_big=x_hat_noisy_big,
+                    v_x_hat_noisy_big=v_x_hat_noisy_big, v_clean=params["v_clean"])
             else:
                 # Reconstruction loss (e.g., L1, LPIPS): pass (x_hat, x)
-                val = loss_fn(x_hat, x)
+                val = loss_fn(input=x_hat, target=x)
             result[loss_fn.id] = val.item()
             total_loss = total_loss + loss_fn.weight * val
         result["loss"] = total_loss

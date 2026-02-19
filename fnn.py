@@ -1848,19 +1848,26 @@ class SAEPixelConsistencyLoss(nn.Module):
         id: str = "pix_con_loss",
         weight: float = 1.0,
         backbone: str = "vgg16",
+        recon_weight: float = 1.0,
+        lpips_weight: float = 1.0,
     ):
         super().__init__()
         self.id = id
         self.weight = weight
         self.backbone = backbone
+        self.recon_weight = recon_weight
+        self.lpips_weight = lpips_weight
 
-    def forward(self, xhat_noisy_small: torch.Tensor, xhat_noisy_big: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_hat_noisy_small: torch.Tensor, x_hat_noisy_big: torch.Tensor, **kwargs) -> torch.Tensor:
         # target is sg(xhat_noisy_small) where sg is torch.stop_gradient, but since LPIPS backbone is frozen
-        return lpips_loss(
-            xhat_noisy_big,
-            xhat_noisy_small.detach(),
+        target = x_hat_noisy_small.detach()
+        lpips = lpips_loss(
+            x_hat_noisy_big,
+            target,
             backbone=self.backbone,
         )
+        recon = F.l1_loss(x_hat_noisy_big, target)
+        return lpips * self.lpips_weight + recon * self.recon_weight
 
 register_type("SAEPixelConsistencyLoss", SAEPixelConsistencyLoss)
 
@@ -1885,8 +1892,8 @@ class SAELatentConsistencyLoss(nn.Module):
         loss = 1.0 - cos_sim
         return loss.mean()
 
-    def forward(self, v_xhat_noisy_big: torch.Tensor, v_clean: torch.Tensor) -> torch.Tensor:
-        return self.cosine_similarity_loss(v_xhat_noisy_big, v_clean)
+    def forward(self, v_x_hat_noisy_big: torch.Tensor, v_clean: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self.cosine_similarity_loss(v_x_hat_noisy_big, v_clean)
 
 register_type("SAELatentConsistencyLoss", SAELatentConsistencyLoss)
 
