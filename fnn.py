@@ -1020,10 +1020,13 @@ class SAE(AutoEncoder):
     def __init__(
         self,
         eps: float = 1e-8,
+        noise_angle_degrees_max: float = 85.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.eps = eps
+        self.noise_angle_degrees_max = noise_angle_degrees_max
+        self.sigma_max = math.tan(math.radians(noise_angle_degrees_max))
 
     def spherify(self, z: torch.Tensor) -> torch.Tensor:
         """Project latent vectors onto a sphere."""
@@ -1036,8 +1039,21 @@ class SAE(AutoEncoder):
     def encode_params(self, x: torch.Tensor) -> dict:
         """Encode and return mu, logvar, and reparameterized sample z."""
         z: torch.Tensor = self.encoder(x)  # (B, latent_channels, H', W')
-        z = self.spherify(z)  # project to sphere
-        return {"z": z}
+        v = self.spherify(z)  # project to sphere
+        if self.training:
+            b, _, _, _ = v.shape
+            sigma = torch.rand(b, 1, 1, 1, device=z.device) * self.sigma_max
+            sigma_sub = torch.rand(b, 1, 1, 1, device=z.device) * 0.5 * sigma
+            e = torch.randn_like(v)
+            v_noisy_big = self.spherify(v + sigma * e)
+            v_noisy_small = self.spherify(v + sigma_sub * e)
+            return {"z": v_noisy_small, "v_noisy_big": v_noisy_big, "v_clean": v}
+        else:
+            return {"z": v, "v_noisy_big": v, "v_clean": v}
+        
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        v = self.spherify(z)
+        return super().decode(v)
 register_type("SAE", SAE)
 
 
@@ -1823,6 +1839,56 @@ class LPIPSLoss(nn.Module):
         )
 
 register_type("LPIPSLoss", LPIPSLoss)
+
+
+class SAEPixelConsistencyLoss(nn.Module):
+    kind = "sae"
+    def __init__(
+        self,
+        id: str = "pix_con_loss",
+        weight: float = 1.0,
+        backbone: str = "vgg16",
+    ):
+        super().__init__()
+        self.id = id
+        self.weight = weight
+        self.backbone = backbone
+
+    def forward(self, xhat_noisy_small: torch.Tensor, xhat_noisy_big: torch.Tensor) -> torch.Tensor:
+        # target is sg(xhat_noisy_small) where sg is torch.stop_gradient, but since LPIPS backbone is frozen
+        return lpips_loss(
+            xhat_noisy_big,
+            xhat_noisy_small.detach(),
+            backbone=self.backbone,
+        )
+
+register_type("SAEPixelConsistencyLoss", SAEPixelConsistencyLoss)
+
+
+class SAELatentConsistencyLoss(nn.Module):
+    kind = "sae"
+    def __init__(
+        self,
+        id: str = "lat_con_loss",
+        weight: float = 1.0,
+    ):
+        super().__init__()
+        self.id = id
+        self.weight = weight
+
+    def cosine_similarity_loss(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a_flat = a.view(a.size(0), -1)
+        b_flat = b.view(b.size(0), -1)
+        a_norm = F.normalize(a_flat, dim=1)
+        b_norm = F.normalize(b_flat, dim=1)
+        cos_sim = (a_norm * b_norm).sum(dim=1)
+        loss = 1.0 - cos_sim
+        return loss.mean()
+
+    def forward(self, v_xhat_noisy_big: torch.Tensor, v_clean: torch.Tensor) -> torch.Tensor:
+        return self.cosine_similarity_loss(v_xhat_noisy_big, v_clean)
+
+register_type("SAELatentConsistencyLoss", SAELatentConsistencyLoss)
 
 
 #

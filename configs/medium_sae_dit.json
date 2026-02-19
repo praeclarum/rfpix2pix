@@ -29,12 +29,24 @@
             {
                 "type": "L1Loss",
                 "id": "recon_loss",
-                "weight": 1.0
+                "weight": 25.0
             },
             {
                 "type": "LPIPSLoss",
                 "id": "lpips_loss",
                 "weight": 1.0
+            },
+            {
+                "type": "SAEPixelConsistencyLoss",
+                "id": "pix_con_loss",
+                "recon_weight": 25.0,
+                "lpips_weight": 1.0,
+                "weight": 1.0
+            },
+            {
+                "type": "SAELatentConsistencyLoss",
+                "id": "lat_con_loss",
+                "weight": 0.1
             }
         ],
         "gradient_clip": 1.0,
